@@ -441,6 +441,200 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess
 	}
 }
 
+func TestClaudeInteractiveSessionRestoresAcrossGatewayRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case " $* " in
+  *" --resume sess-persist "*) text=turn2 ;;
+  *) text=turn1 ;;
+esac
+printf '{"type":"assistant","session_id":"sess-persist","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$text" "$text" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-persist","stop_reason":"end_turn","result":"%s"}\n' "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+	ask := func(s *Server, msgs string) string {
+		t.Helper()
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":` + msgs + `}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, "desktop-session-1")
+		rec := httptest.NewRecorder()
+		var u Usage
+		if code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+			t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			t.Fatalf("answer: %s (%v)", rec.Body, err)
+		}
+		return res.Content[0].Text
+	}
+
+	s1 := New()
+	first := ask(s1, `[`+msg("user", "hello")+`]`)
+	if first != "turn1" {
+		t.Fatalf("first = %q", first)
+	}
+	// Simulate a clean gateway restart after the completed turn was parked.
+	s1.subscription.abortAll()
+
+	s2 := New()
+	t.Cleanup(s2.subscription.abortAll)
+	second := ask(s2, `[`+msg("user", "hello")+`,`+msg("assistant", first)+`,`+msg("user", "and?")+`]`)
+	if second != "turn2" {
+		t.Fatalf("second = %q", second)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(b)
+	if !strings.Contains(log, "--resume sess-persist") {
+		t.Fatalf("gateway restart did not restore the persisted inner Claude session:\n%s", log)
+	}
+	parts := strings.Split(log, "stdin:")
+	if len(parts) < 3 {
+		t.Fatalf("bridge log missing second stdin:\n%s", log)
+	}
+	secondPrompt := parts[len(parts)-1]
+	if !strings.Contains(secondPrompt, "and?") || strings.Contains(secondPrompt, "Human: hello") || strings.Contains(secondPrompt, "turn1") {
+		t.Fatalf("restored turn replayed old history instead of only the suffix:\n%s", secondPrompt)
+	}
+}
+
+func TestClaudeInteractiveDirtyPersistedSessionIsNotRestored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s stdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+echo '{"type":"assistant","session_id":"sess-new","uuid":"row-new","message":{"id":"m-new","model":"claude-opus-5-5","content":[{"type":"text","text":"fresh"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-new","stop_reason":"end_turn","result":"fresh"}'
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	owner := "claude\x00u"
+	outer := "desktop-session-dirty"
+	reqForKey := &Request{Model: "claude-opus-5-5", Tools: []Tool{{Name: "read"}}}
+	b := newSubscriptionBridge()
+	b.saveInteractiveSession(owner, outer, interactiveSessionEntry{
+		SessionID: "sess-old", ConvKey: "checkpoint", ContextKey: turnKey(owner, reqForKey, nil), Dirty: true,
+	})
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hello"}]}`
+	h := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	h.Header.Set(SessionHeader, outer)
+	rec := httptest.NewRecorder()
+	var u Usage
+	if code, why := s.serveClaudeSubscription(rec, h, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+		t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+	}
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "--resume sess-old") {
+		t.Fatalf("dirty inner session was resumed:\n%s", data)
+	}
+}
+
+func TestConversationSuffixAfterRequiresExactCompletedAssistantCheckpoint(t *testing.T) {
+	owner := "claude\x00u"
+	base := []Message{
+		{Role: "user", Parts: []Part{{Kind: Text, Text: "hello"}}},
+		{Role: "assistant", Parts: []Part{{Kind: Text, Text: "turn1"}}},
+	}
+	keys := conversationKeys(owner, base)
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v", keys)
+	}
+	msgs := append(slices.Clone(base), Message{Role: "user", Parts: []Part{{Kind: Text, Text: "and?"}}})
+	since, ok := conversationSuffixAfter(owner, msgs, keys[0])
+	if !ok || len(since) != 1 || since[0].Parts[0].Text != "and?" {
+		t.Fatalf("suffix = %#v, %v", since, ok)
+	}
+	diverged := []Message{
+		{Role: "user", Parts: []Part{{Kind: Text, Text: "hello"}}},
+		{Role: "assistant", Parts: []Part{{Kind: Text, Text: "edited"}}},
+		{Role: "user", Parts: []Part{{Kind: Text, Text: "and?"}}},
+	}
+	if got, ok := conversationSuffixAfter(owner, diverged, keys[0]); ok || got != nil {
+		t.Fatalf("diverged history restored: %#v", got)
+	}
+}
+
+func TestClaudeInteractiveEffortChangeKeepsInnerSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s stdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case " $* " in *" --resume sess-effort "*) text=turn2 ;; *) text=turn1 ;; esac
+printf '{"type":"assistant","session_id":"sess-effort","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$text" "$text" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-effort","stop_reason":"end_turn","result":"%s"}\n' "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	ask := func(effort, msgs string) string {
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"thinking":{"type":"adaptive"},"output_config":{"effort":"` + effort + `"},"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":` + msgs + `}`
+		rec := httptest.NewRecorder()
+		var u Usage
+		if code, why := s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+			t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &res)
+		return res.Content[0].Text
+	}
+	first := ask("max", `[{"role":"user","content":"hello"}]`)
+	second := ask("high", `[{"role":"user","content":"hello"},{"role":"assistant","content":"`+first+`"},{"role":"user","content":"and?"}]`)
+	if second != "turn2" {
+		t.Fatalf("second = %q", second)
+	}
+	b, _ := os.ReadFile(logPath)
+	log := string(b)
+	if !strings.Contains(log, "--resume sess-effort") || !strings.Contains(log, "--effort high") {
+		t.Fatalf("effort change started a new inner session instead of resuming it at high:\n%s", log)
+	}
+}
+
 func TestCleanClaudeEnvRemovesGatewayOverrides(t *testing.T) {
 	got := cleanClaudeEnv([]string{
 		"PATH=/bin", "ANTHROPIC_BASE_URL=http://127.0.0.1:3425",
