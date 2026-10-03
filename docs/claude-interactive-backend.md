@@ -80,6 +80,27 @@ Verified:
 - transcript rows where thinking and visible text share one message id;
 - cleanup of detached tmux/Claude children after one-off requests.
 
+## Long-thinking keepalive
+
+Interactive Opus turns can stay inside the TUI for more than five minutes
+without appending a transcript row. Magpie's generic relay deliberately stops
+synthetic keepalives after five minutes of total provider silence, so Claude
+Desktop can otherwise cancel a healthy interactive turn at roughly the same
+boundary.
+
+The interactive backend therefore emits an internal liveness event every 15
+seconds while its bridge process is alive. The event has no model/content
+semantics; `relay` translates it into the downstream protocol's normal
+keepalive (`ping` for Anthropic). This preserves the generic five-minute
+stuck-provider protection: only the PTY backend, whose child process Magpie
+directly owns, is allowed to prove continued liveness.
+
+The first liveness event may also open a streaming response before the model's
+first transcript row. Fast quota/auth errors still retain ordinary HTTP error
+status because the first heartbeat is delayed; once a genuinely long-running
+interactive turn has been acknowledged as alive, any later failure is reported
+inside the already-open stream.
+
 Deliberately conservative behavior:
 
 - an effort-level change between turns abandons the interactive run and falls

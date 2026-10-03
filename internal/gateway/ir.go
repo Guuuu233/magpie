@@ -159,6 +159,7 @@ const (
 	KUsage                      // Usage
 	KError                      // Text
 	KSearch                     // Text (the query), Hits: a web search run for the model
+	KAlive                      // internal liveness only; never user-visible
 )
 
 // Event is one thing a streaming reply said.

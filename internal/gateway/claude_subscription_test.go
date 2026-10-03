@@ -258,6 +258,59 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1
 	}
 }
 
+func TestInteractiveRunEmitsAliveWhileBridgeIsQuiet(t *testing.T) {
+	old := interactiveAliveEvery
+	interactiveAliveEvery = 10 * time.Millisecond
+	t.Cleanup(func() { interactiveAliveEvery = old })
+	r := &subscriptionRun{interactive: true}
+	ch := r.attach()
+	done := make(chan struct{})
+	go r.keepInteractiveAlive(done)
+	defer close(done)
+	select {
+	case ev := <-ch:
+		if ev.Kind != KAlive {
+			t.Fatalf("got event kind %v, want KAlive", ev.Kind)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("interactive run emitted no liveness event")
+	}
+}
+
+func TestClaudeInteractiveQuietTurnStreamsKeepaliveBeforeAnswer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	old := interactiveAliveEvery
+	interactiveAliveEvery = 10 * time.Millisecond
+	t.Cleanup(func() { interactiveAliveEvery = old })
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	script := `#!/bin/sh
+cat >/dev/null
+sleep 0.08
+echo '{"type":"assistant","session_id":"sess-quiet","uuid":"row-quiet","message":{"id":"m-quiet","model":"claude-opus-5-5","content":[{"type":"text","text":"QUIET_OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-quiet","stop_reason":"end_turn","result":"QUIET_OK"}'
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	body := `{"model":"claude-opus-5-5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"quiet"}]}`
+	rec := httptest.NewRecorder()
+	var u Usage
+	if code, msg := s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+		t.Fatalf("%d %s: %s", code, msg, rec.Body.String())
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, `"type":"ping"`) || !strings.Contains(out, "QUIET_OK") {
+		t.Fatalf("quiet interactive turn was not kept alive before its answer:\n%s", out)
+	}
+}
+
 func TestClaudeInteractiveOneOffLetsBridgeCleanDetachedChild(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script and setsid stand in for an interactive PTY bridge")

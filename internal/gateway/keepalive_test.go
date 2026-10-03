@@ -218,6 +218,40 @@ func TestRelayKeepsClientAlive(t *testing.T) {
 	}
 }
 
+// An interactive Claude turn can legitimately spend many minutes inside the
+// TUI before appending another transcript row. KAlive is Magpie's internal
+// evidence that the bridge process is still alive. It must be translated to a
+// protocol keepalive even before the first model event, otherwise Claude
+// Desktop's request watchdog eventually cancels the HTTP request.
+func TestRelayInternalAliveCanOpenStreamBeforeFirstModelEvent(t *testing.T) {
+	keepFast(t, time.Millisecond, 10*time.Millisecond, 40*time.Millisecond)
+	events := make(chan Event)
+	go func() {
+		events <- Event{Kind: KAlive}
+		time.Sleep(60 * time.Millisecond)
+		events <- Event{Kind: KAlive}
+		time.Sleep(60 * time.Millisecond)
+		events <- Event{Kind: KStart, MsgID: "m1", Model: "claude-opus-5-5"}
+		events <- Event{Kind: KText, Text: "done"}
+		events <- Event{Kind: KStop, Stop: "stop"}
+		close(events)
+	}()
+	rec := httptest.NewRecorder()
+	req := &Request{Model: "claude-opus-5-5", Stream: true}
+	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	code, failed := relay(rec, r, provider.Anthropic, "Claude Code", req, events, &Usage{}, func() {}, func(string, string, bool) {})
+	if code != 200 || failed != "" {
+		t.Fatalf("relay: %d %q", code, failed)
+	}
+	body := rec.Body.String()
+	if n := strings.Count(body, `"type":"ping"`); n < 2 {
+		t.Fatalf("internal liveness did not keep stream alive: %d pings\n%s", n, body)
+	}
+	if !strings.Contains(body, `"type":"message_stop"`) || !strings.Contains(body, "done") {
+		t.Fatalf("reply incomplete:\n%s", body)
+	}
+}
+
 // TestTraceKeepsInflight: a request still going stays in the trace while
 // more than traceKeep come and finish after it (#436).
 func TestTraceKeepsInflight(t *testing.T) {
