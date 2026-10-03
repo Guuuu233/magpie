@@ -518,6 +518,148 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess
 	}
 }
 
+func TestClaudeInteractiveSessionRestoresAfterEarlierHistoryRewrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case " $* " in
+  *" --resume sess-persist "*) text=turn2 ;;
+  *) text=turn1 ;;
+esac
+printf '{"type":"assistant","session_id":"sess-persist","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$text" "$text" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-persist","stop_reason":"end_turn","result":"%s"}\n' "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+	ask := func(s *Server, msgs string) string {
+		t.Helper()
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":` + msgs + `}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, "desktop-session-rewritten")
+		rec := httptest.NewRecorder()
+		var u Usage
+		if code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+			t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			t.Fatalf("answer: %s (%v)", rec.Body, err)
+		}
+		return res.Content[0].Text
+	}
+
+	s1 := New()
+	first := ask(s1, `[`+msg("user", "hello")+`]`)
+	if first != "turn1" {
+		t.Fatalf("first = %q", first)
+	}
+	s1.subscription.abortAll()
+
+	// Claude Desktop can rewrite/compact older history while preserving the
+	// last completed assistant reply. That must not turn a restart into a
+	// full-history replay: the persisted inner session already owns that
+	// history and only the new user suffix belongs in its next prompt.
+	s2 := New()
+	t.Cleanup(s2.subscription.abortAll)
+	second := ask(s2, `[`+msg("user", "hello rewritten by outer client")+`,`+msg("assistant", first)+`,`+msg("user", "and?")+`]`)
+	if second != "turn2" {
+		t.Fatalf("rewritten outer history lost persisted inner session: second = %q", second)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(b)
+	if !strings.Contains(log, "--resume sess-persist") {
+		t.Fatalf("rewritten outer history did not resume persisted inner session:\n%s", log)
+	}
+	parts := strings.Split(log, "stdin:")
+	if len(parts) < 3 {
+		t.Fatalf("bridge log missing second stdin:\n%s", log)
+	}
+	secondPrompt := parts[len(parts)-1]
+	if !strings.Contains(secondPrompt, "and?") || strings.Contains(secondPrompt, "hello rewritten") || strings.Contains(secondPrompt, "turn1") {
+		t.Fatalf("rewritten outer history was replayed instead of only the suffix:\n%s", secondPrompt)
+	}
+}
+
+func TestClaudeInteractiveCheckpointMissRefusesFullHistoryReplay(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+echo '{"type":"assistant","session_id":"sess-persist","uuid":"row-turn1","message":{"id":"m-turn1","model":"claude-opus-5-5","content":[{"type":"text","text":"turn1"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-persist","stop_reason":"end_turn","result":"turn1"}'
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	outer := "desktop-session-checkpoint-miss"
+	request := func(s *Server, msgs string) (int, string) {
+		t.Helper()
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":` + msgs + `}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, outer)
+		rec := httptest.NewRecorder()
+		var u Usage
+		code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u)
+		return code, why + "\n" + rec.Body.String()
+	}
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+
+	s1 := New()
+	if code, body := request(s1, `[`+msg("user", "hello")+`]`); code != 200 {
+		t.Fatalf("first request: %d %s", code, body)
+	}
+	s1.subscription.abortAll()
+
+	// Both the old history and the last completed assistant reply were
+	// rewritten. There is no safe checkpoint from which the persisted inner
+	// session can accept only a suffix. Replaying the entire outer history into
+	// a fresh inner session is precisely the corruption this test forbids.
+	s2 := New()
+	t.Cleanup(s2.subscription.abortAll)
+	code, body := request(s2, `[`+
+		msg("user", "hello rewritten")+`,`+
+		msg("assistant", "turn1 rewritten")+`,`+
+		msg("user", "and?")+`]`)
+	if code != 502 || !strings.Contains(body, "checkpoint_not_found") {
+		t.Fatalf("checkpoint miss = %d %s; want 502 checkpoint_not_found", code, body)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(b), "args:"); got != 1 {
+		t.Fatalf("checkpoint miss started a second bridge and replayed history (%d calls):\n%s", got, b)
+	}
+}
+
 func TestClaudeInteractiveDirtyPersistedSessionIsNotRestored(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")
@@ -538,9 +680,9 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-n
 	}
 	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
 	t.Setenv("FAKE_BRIDGE_LOG", logPath)
-	owner := "claude\x00u"
+	owner := "claude\x00u\x00" + ownHome
 	outer := "desktop-session-dirty"
-	reqForKey := &Request{Model: "claude-opus-5-5", Tools: []Tool{{Name: "read"}}}
+	reqForKey := &Request{Model: "claude-opus-5-5", Tools: []Tool{{Name: "read", Schema: json.RawMessage(`{"type":"object"}`)}}}
 	b := newSubscriptionBridge()
 	b.saveInteractiveSession(owner, outer, interactiveSessionEntry{
 		SessionID: "sess-old", ConvKey: "checkpoint", ContextKey: turnKey(owner, reqForKey, nil), Dirty: true,
@@ -554,12 +696,12 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-n
 	h.Header.Set(SessionHeader, outer)
 	rec := httptest.NewRecorder()
 	var u Usage
-	if code, why := s.serveClaudeSubscription(rec, h, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
-		t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+	if code, why := s.serveClaudeSubscription(rec, h, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 502 || !strings.Contains(why, "dirty") {
+		t.Fatalf("dirty persisted session = %d %s: %s; want 502 dirty", code, why, rec.Body.String())
 	}
 	data, _ := os.ReadFile(logPath)
-	if strings.Contains(string(data), "--resume sess-old") {
-		t.Fatalf("dirty inner session was resumed:\n%s", data)
+	if len(data) != 0 {
+		t.Fatalf("dirty persisted session launched a bridge instead of failing closed:\n%s", data)
 	}
 }
 
@@ -585,6 +727,63 @@ func TestConversationSuffixAfterRequiresExactCompletedAssistantCheckpoint(t *tes
 	}
 	if got, ok := conversationSuffixAfter(owner, diverged, keys[0]); ok || got != nil {
 		t.Fatalf("diverged history restored: %#v", got)
+	}
+}
+
+func TestClaudeInteractiveRestoreReasons(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	owner := "claude\x00u"
+	baseReq := Request{
+		Model: "claude-opus-5-5",
+		Tools: []Tool{{Name: "read", Schema: json.RawMessage(`{"type":"object"}`)}},
+	}
+	base := []Message{
+		{Role: "user", Parts: []Part{{Kind: Text, Text: "hello"}}},
+		{Role: "assistant", Parts: []Part{{Kind: Text, Text: "turn1"}}},
+	}
+	keys := conversationKeys(owner, base)
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v", keys)
+	}
+	contextKey := turnKey(owner, &baseReq, nil)
+	replyKey := assistantReplyKey(base[1])
+	b := newSubscriptionBridge()
+
+	missingReq := baseReq
+	missingReq.Messages = append(slices.Clone(base), Message{Role: "user", Parts: []Part{{Kind: Text, Text: "and?"}}})
+	if _, _, got := b.restoreInteractiveSession(owner, "missing", &missingReq); got != interactiveRestoreStateMissing {
+		t.Fatalf("state missing reason = %q", got)
+	}
+
+	b.saveInteractiveSession(owner, "dirty", interactiveSessionEntry{
+		SessionID: "sess-dirty", ConvKey: keys[0], ReplyKey: replyKey, ContextKey: contextKey, Dirty: true,
+	})
+	if _, _, got := b.restoreInteractiveSession(owner, "dirty", &missingReq); got != interactiveRestoreDirty {
+		t.Fatalf("dirty reason = %q", got)
+	}
+
+	b.saveInteractiveSession(owner, "context", interactiveSessionEntry{
+		SessionID: "sess-context", ConvKey: keys[0], ReplyKey: replyKey, ContextKey: "different",
+	})
+	if _, _, got := b.restoreInteractiveSession(owner, "context", &missingReq); got != interactiveRestoreContextMismatch {
+		t.Fatalf("context mismatch reason = %q", got)
+	}
+
+	b.saveInteractiveSession(owner, "checkpoint", interactiveSessionEntry{
+		SessionID: "sess-checkpoint", ConvKey: "missing", ReplyKey: "missing", ContextKey: contextKey,
+	})
+	if _, _, got := b.restoreInteractiveSession(owner, "checkpoint", &missingReq); got != interactiveRestoreCheckpointNotFound {
+		t.Fatalf("checkpoint reason = %q", got)
+	}
+
+	b.saveInteractiveSession(owner, "suffix", interactiveSessionEntry{
+		SessionID: "sess-suffix", ConvKey: keys[0], ReplyKey: replyKey, ContextKey: contextKey,
+	})
+	suffixReq := baseReq
+	suffixReq.Messages = append(slices.Clone(base), Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "toolu_1", Text: "old tool output"}}})
+	if _, _, got := b.restoreInteractiveSession(owner, "suffix", &suffixReq); got != interactiveRestoreSuffixRejected {
+		t.Fatalf("suffix rejected reason = %q", got)
 	}
 }
 
