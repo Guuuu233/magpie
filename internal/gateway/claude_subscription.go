@@ -365,14 +365,31 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		// messages after the last completed assistant checkpoint are submitted;
 		// replaying the whole caller history would both duplicate context and
 		// destroy the prompt-cache prefix the inner session already owns.
-		if saved, ok := b.interactiveSession(owner, outerSession); ok && !saved.Dirty && saved.ContextKey == turnKey(owner, req, nil) {
-			if since, ok := conversationSuffixAfter(owner, req.Messages, saved.ConvKey); ok {
-				bridgePrompt, bridgeImages, err = renderClaudeBridgeTurnWithImages(since)
-				resumeID = saved.SessionID
+		saved, since, restore := b.restoreInteractiveSession(owner, outerSession, req)
+		if outerSession != "" {
+			key := interactiveSessionStateKey(owner, outerSession)
+			if len(key) > 12 {
+				key = key[:12]
+			}
+			switch restore {
+			case interactiveRestoreStateMissing:
+				log.Printf("Claude interactive persisted resume: reason=%s session=%s", restore, key)
+			case interactiveRestoreReplyAnchor:
+				log.Printf("Claude interactive persisted resume recovered: reason=%s session=%s", restore, key)
+			case interactiveRestoreExact:
+			default:
+				log.Printf("Claude interactive persisted resume refused: reason=%s session=%s", restore, key)
 			}
 		}
-		if resumeID == "" {
+		switch restore {
+		case interactiveRestoreExact, interactiveRestoreReplyAnchor:
+			bridgePrompt, bridgeImages, err = renderClaudeBridgeTurnWithImages(since)
+			resumeID = saved.SessionID
+		case interactiveRestoreStateMissing:
 			bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
+		default:
+			cleanup()
+			return nil, nil, fmt.Errorf("Claude interactive persisted resume failed: %s; refusing full history replay", restore)
 		}
 		if err != nil {
 			cleanup()
@@ -746,7 +763,7 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 		sessionID := r.sessionID
 		r.mu.Unlock()
 		b.saveInteractiveSession(r.owner, r.outerSession, interactiveSessionEntry{
-			SessionID: sessionID, ConvKey: convKey, ContextKey: turnKey(r.owner, req, nil),
+			SessionID: sessionID, ConvKey: convKey, ReplyKey: assistantReplyKey(reply), ContextKey: turnKey(r.owner, req, nil),
 		})
 	}
 	r.timer.Reset(idleLongest)

@@ -14,9 +14,30 @@ import (
 
 const interactiveSessionStateVersion = 1
 
+type interactiveRestoreStatus string
+
+const (
+	interactiveRestoreExact              interactiveRestoreStatus = "exact"
+	interactiveRestoreReplyAnchor        interactiveRestoreStatus = "reply_anchor"
+	interactiveRestoreStateMissing       interactiveRestoreStatus = "state_missing"
+	interactiveRestoreDirty              interactiveRestoreStatus = "dirty"
+	interactiveRestoreContextMismatch    interactiveRestoreStatus = "context_mismatch"
+	interactiveRestoreCheckpointNotFound interactiveRestoreStatus = "checkpoint_not_found"
+	interactiveRestoreSuffixRejected     interactiveRestoreStatus = "suffix_rejected"
+)
+
+type conversationSuffixStatus uint8
+
+const (
+	conversationSuffixOK conversationSuffixStatus = iota
+	conversationSuffixCheckpointNotFound
+	conversationSuffixRejected
+)
+
 type interactiveSessionEntry struct {
 	SessionID  string    `json:"session_id"`
 	ConvKey    string    `json:"conv_key"`
+	ReplyKey   string    `json:"reply_key,omitempty"`
 	ContextKey string    `json:"context_key"`
 	Dirty      bool      `json:"dirty,omitempty"`
 	UpdatedAt  time.Time `json:"updated_at"`
@@ -147,14 +168,56 @@ func (b *subscriptionBridge) markInteractiveSessionDirty(owner, outerSession str
 	}
 }
 
+// restoreInteractiveSession decides whether a persisted inner Claude session
+// can safely accept only the caller's new suffix. A persisted entry is never
+// permission to replay the whole outer history: if continuity cannot be
+// proven, the caller must fail closed rather than duplicate old tool output
+// and messages into a fresh inner session.
+func (b *subscriptionBridge) restoreInteractiveSession(owner, outerSession string, req *Request) (interactiveSessionEntry, []Message, interactiveRestoreStatus) {
+	saved, ok := b.interactiveSession(owner, outerSession)
+	if !ok {
+		return interactiveSessionEntry{}, nil, interactiveRestoreStateMissing
+	}
+	if saved.Dirty {
+		return saved, nil, interactiveRestoreDirty
+	}
+	if saved.ContextKey != turnKey(owner, req, nil) {
+		return saved, nil, interactiveRestoreContextMismatch
+	}
+	since, status := conversationSuffixAfterDetailed(owner, req.Messages, saved.ConvKey)
+	switch status {
+	case conversationSuffixOK:
+		return saved, since, interactiveRestoreExact
+	case conversationSuffixRejected:
+		return saved, nil, interactiveRestoreSuffixRejected
+	}
+	if saved.ReplyKey == "" {
+		return saved, nil, interactiveRestoreCheckpointNotFound
+	}
+	since, status = conversationSuffixAfterReplyDetailed(req.Messages, saved.ReplyKey)
+	switch status {
+	case conversationSuffixOK:
+		return saved, since, interactiveRestoreReplyAnchor
+	case conversationSuffixRejected:
+		return saved, nil, interactiveRestoreSuffixRejected
+	default:
+		return saved, nil, interactiveRestoreCheckpointNotFound
+	}
+}
+
 // conversationSuffixAfter returns only what the caller said after a completed
 // assistant checkpoint already present in a persisted inner Claude session.
 // It deliberately refuses suffixes containing assistant/tool-result messages:
 // those mean another path has advanced or rewritten the outer conversation,
 // and replaying them as one interactive prompt would duplicate history.
 func conversationSuffixAfter(owner string, msgs []Message, convKey string) ([]Message, bool) {
+	since, status := conversationSuffixAfterDetailed(owner, msgs, convKey)
+	return since, status == conversationSuffixOK
+}
+
+func conversationSuffixAfterDetailed(owner string, msgs []Message, convKey string) ([]Message, conversationSuffixStatus) {
 	if convKey == "" {
-		return nil, false
+		return nil, conversationSuffixCheckpointNotFound
 	}
 	h := sha256.New()
 	_, _ = h.Write([]byte(owner + "\x00"))
@@ -164,19 +227,64 @@ func conversationSuffixAfter(owner string, msgs []Message, convKey string) ([]Me
 			match = i
 		}
 	})
+	return safeConversationSuffixAfterDetailed(msgs, match)
+}
+
+// assistantReplyKey is a history-independent anchor for the last completed
+// reply saved in the inner Claude session. Unlike ConvKey it survives an
+// outer client compacting or rewriting messages that came before that reply.
+func assistantReplyKey(msg Message) string {
+	if msg.Role != "assistant" {
+		return ""
+	}
+	h := sha256.New()
+	hashMessages(h, []Message{msg}, nil)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// conversationSuffixAfterReply finds a persisted completed reply after an
+// outer client rewrote earlier history. The reply must occur exactly once:
+// resuming from an ambiguous repeated answer could attach the new user turn
+// to the wrong point in the inner conversation.
+func conversationSuffixAfterReply(msgs []Message, replyKey string) ([]Message, bool) {
+	since, status := conversationSuffixAfterReplyDetailed(msgs, replyKey)
+	return since, status == conversationSuffixOK
+}
+
+func conversationSuffixAfterReplyDetailed(msgs []Message, replyKey string) ([]Message, conversationSuffixStatus) {
+	if replyKey == "" {
+		return nil, conversationSuffixCheckpointNotFound
+	}
+	match := -1
+	for i, m := range msgs {
+		if m.Role != "assistant" || assistantReplyKey(m) != replyKey {
+			continue
+		}
+		if match >= 0 {
+			return nil, conversationSuffixRejected
+		}
+		match = i
+	}
+	return safeConversationSuffixAfterDetailed(msgs, match)
+}
+
+func safeConversationSuffixAfterDetailed(msgs []Message, match int) ([]Message, conversationSuffixStatus) {
 	if match < 0 || match >= len(msgs)-1 {
-		return nil, false
+		if match < 0 {
+			return nil, conversationSuffixCheckpointNotFound
+		}
+		return nil, conversationSuffixRejected
 	}
 	since := msgs[match+1:]
 	for _, m := range since {
 		if m.Role == "assistant" {
-			return nil, false
+			return nil, conversationSuffixRejected
 		}
 		for _, p := range m.Parts {
 			if p.Kind == ToolResult {
-				return nil, false
+				return nil, conversationSuffixRejected
 			}
 		}
 	}
-	return since, true
+	return since, conversationSuffixOK
 }
