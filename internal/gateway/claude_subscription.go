@@ -402,6 +402,14 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 			}
 			resumeID = saved.SessionID
 		case interactiveRestoreStateMissing:
+			// A genuinely new outer conversation has no assistant reply yet.
+			// If an established conversation loses its persisted state, replaying
+			// the entire outer history into a fresh inner Claude session can
+			// duplicate old tool output and stale logs. Fail closed instead.
+			if hasReply(req.Messages) && !suggestionFork {
+				cleanup()
+				return nil, nil, fmt.Errorf("Claude interactive persisted resume failed: state_missing on established conversation; refusing full history replay")
+			}
 			bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
 		default:
 			if suggestionFork {
