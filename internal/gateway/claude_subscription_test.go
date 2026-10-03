@@ -588,6 +588,61 @@ func TestConversationSuffixAfterRequiresExactCompletedAssistantCheckpoint(t *tes
 	}
 }
 
+func TestClaudeInteractiveSessionWorkDirIsStableAndInTemp(t *testing.T) {
+	tmp := t.TempDir()
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, tmp)
+	}
+	dir1, err := interactiveSessionWorkDir("claude\x00u", "desktop-session-workdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir2, err := interactiveSessionWorkDir("claude\x00u", "desktop-session-workdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir1 != dir2 {
+		t.Fatalf("interactive cwd changed: %q != %q", dir1, dir2)
+	}
+	root, err := filepath.EvalSymlinks(tmp)
+	if err != nil {
+		root = tmp
+	}
+	got, err := filepath.EvalSymlinks(dir1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root && !strings.HasPrefix(got, root+string(os.PathSeparator)) {
+		t.Fatalf("interactive cwd %q is not under temp %q", got, root)
+	}
+	fi, err := os.Stat(dir1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		t.Fatalf("interactive cwd is writable by others: %v", fi.Mode().Perm())
+	}
+}
+
+func TestClaudeInteractiveSessionWorkDirRejectsWritableByOthers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows permission bits do not model a shared Unix temp directory")
+	}
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	owner, outer := "claude\x00u", "desktop-session-unsafe-workdir"
+	dir := filepath.Join(tmp, "magpie-claude-interactive-"+interactiveSessionStateKey(owner, outer))
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := interactiveSessionWorkDir(owner, outer); err == nil {
+		t.Fatalf("world-writable interactive cwd %q was accepted", dir)
+	}
+}
+
 func TestClaudeInteractiveEffortChangeKeepsInnerSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")

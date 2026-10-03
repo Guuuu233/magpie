@@ -100,6 +100,45 @@ func TestClaudeSchemaAnswer(t *testing.T) {
 	}
 }
 
+func TestClaudeInteractiveSchemaAnswer(t *testing.T) {
+	run := &subscriptionRun{schema: true, interactive: true}
+	seg := run.attach()
+	lines := []string{
+		`{"type":"assistant","session_id":"sess-schema","uuid":"row-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"Blue."}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":2}}}`,
+		`{"type":"assistant","session_id":"sess-schema","uuid":"row-2","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_schema","name":"StructuredOutput","input":{"color":"blue"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"sess-schema","stop_reason":"end_turn","result":"{\"color\":\"blue\"}","structured_output":{"color":"blue"}}`,
+	}
+	go run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	var got []string
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case e, ok := <-seg:
+			if !ok {
+				s := strings.Join(append(got, "end"), "|")
+				if s != `start:m1|start:m2|text:{"color":"blue"}|stop:stop|end` {
+					t.Fatalf("events: %s", s)
+				}
+				return
+			}
+			switch e.Kind {
+			case KStart:
+				got = append(got, "start:"+e.MsgID)
+			case KText:
+				got = append(got, "text:"+e.Text)
+			case KToolStart, KToolArgs:
+				got = append(got, "tool:"+e.Name+e.Text)
+			case KStop:
+				got = append(got, "stop:"+e.Stop)
+			case KError:
+				got = append(got, "error:"+e.Text)
+			}
+		case <-timeout:
+			t.Fatalf("reply never ended: %s", strings.Join(got, "|"))
+		}
+	}
+}
+
 // A StructuredOutput call that doesn't fit the schema is told so by Claude
 // Code, which has the model call it again: the client gets the call that
 // fit, never the one turned away, and one reply.

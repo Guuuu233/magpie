@@ -103,15 +103,11 @@ type subscriptionRun struct {
 	model  string
 	cmd    *exec.Cmd
 	tree   *proc.Tree // cmd once started, with all it starts
-	tmp    string
+	tmp    string     // ephemeral files owned by this logical run
+	work   string     // cwd given to Claude Code; stable for interactive resume
 	// schema says the client asked for an answer fitting a JSON schema,
 	// which Claude Code gives as its StructuredOutput call
 	schema bool
-	// persistentWork is a stable cwd for an outer interactive conversation.
-	// Claude Code indexes sessions by project/cwd, so a fresh /tmp directory
-	// on every gateway process restart makes --resume unable to find the old
-	// session even when its session id was persisted.
-	persistentWork bool
 
 	// interactive is an experimental transport in which an outer bridge
 	// drives the real Claude Code TUI inside a PTY. sessionID is the Claude
@@ -342,19 +338,17 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	if !interactive {
 		b.sweep.Do(func() { go sweepBridgeProjects(claudeConfigDir(), os.TempDir()) })
 	}
-	var tmp string
-	persistentWork := interactive && outerSession != ""
-	if persistentWork {
-		tmp, err = interactiveSessionWorkDir(owner, outerSession)
-	} else {
-		tmp, err = os.MkdirTemp("", "magpie-claude-")
-	}
+	tmp, err := os.MkdirTemp("", "magpie-claude-")
 	if err != nil {
 		return nil, nil, err
 	}
-	cleanup := func() {
-		if !persistentWork {
-			_ = os.RemoveAll(tmp)
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	work := tmp
+	if interactive && outerSession != "" {
+		work, err = interactiveSessionWorkDir(owner, outerSession)
+		if err != nil {
+			cleanup()
+			return nil, nil, err
 		}
 	}
 
@@ -386,11 +380,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		tools = bridgeTools(req)
 	}
 	token := randomToken()
-	toolsName := "tools.json"
-	if persistentWork {
-		toolsName = "tools-" + token[:16] + ".json"
-	}
-	toolsPath := filepath.Join(tmp, toolsName)
+	toolsPath := filepath.Join(tmp, "tools.json")
 	toolBytes, _ := json.Marshal(tools)
 	if err := os.WriteFile(toolsPath, toolBytes, 0o600); err != nil {
 		cleanup()
@@ -411,7 +401,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		args = append(args, "--json-schema", string(req.Schema))
 	}
 	cmd := proc.CommandContext(context.Background(), binary, args...)
-	cmd.Dir = tmp
+	cmd.Dir = work
 	env := netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
 	env = inClaudeDir(env, configDir)
 	cmd.Env = env
@@ -441,11 +431,10 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	}
 
 	run := &subscriptionRun{
-		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp,
+		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp, work: work,
 		interactive: interactive, schema: len(req.Schema) > 0, sessionID: resumeID, outerSession: outerSession, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
-		persistentWork: persistentWork,
-		images:         bridgeImages,
-		pending:        map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
+		images:  bridgeImages,
+		pending: map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
 	}
 	if interactive {
 		run.outputDone = make(chan struct{})
@@ -596,7 +585,7 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string, imag
 	binary := r.binary
 	mcpConfig := r.mcpConfig
 	model := r.model
-	tmp := r.tmp
+	work := r.work
 	toolsPath := r.toolsPath
 	env := slices.Clone(r.env)
 	effort := r.effort
@@ -628,8 +617,11 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string, imag
 		return nil, err
 	}
 	args := claudeInteractiveCLIArgs(model, mcpConfig, effort, req.WebSearch, sessionID)
+	if len(req.Schema) > 0 {
+		args = append(args, "--json-schema", string(req.Schema))
+	}
 	cmd := proc.CommandContext(context.Background(), binary, args...)
-	cmd.Dir = tmp
+	cmd.Dir = work
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(prompt)
 	stdout, err := cmd.StdoutPipe()
@@ -1257,7 +1249,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				for _, block := range m.Content {
 					switch block.Type {
 					case "text":
-						if block.Text != "" {
+						if block.Text != "" && !r.schema {
 							r.emit(Event{Kind: KText, Text: block.Text})
 						}
 					case "thinking":
@@ -2028,11 +2020,7 @@ func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
 		}
 	}
 	b.mu.Unlock()
-	if run.persistentWork {
-		_ = os.Remove(run.toolsPath)
-	} else {
-		_ = os.RemoveAll(run.tmp)
-	}
+	_ = os.RemoveAll(run.tmp)
 }
 
 // ownHome marks a run's owner as Claude Code's own sign-in, run in its

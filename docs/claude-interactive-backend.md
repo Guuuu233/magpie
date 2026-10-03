@@ -102,22 +102,35 @@ messages after the checkpoint are pasted into Claude. If the history was
 rewritten, or the request context no longer matches, the mapping is ignored
 rather than risking duplicated context.
 
-Interactive work uses a stable directory under Magpie's cache directory. This
-is necessary because Claude Code indexes persisted sessions by project/cwd. An
-earlier prototype used `/tmp/magpie-claude-*`; Magpie intentionally sweeps
-those temporary project transcripts, so a persisted inner session id could not
-actually survive a gateway process restart.
+Interactive work uses one stable directory per outer conversation under the
+system temp directory. This is necessary because Claude Code indexes persisted
+sessions by project/cwd. The path is deterministic from a hashed outer-session
+key, is rejected if it is not a real directory or is writable by other users,
+and is probed for writability before use. Keeping it outside the home also
+avoids Claude Code adding an unrelated dotfiles repository's git status to the
+system prompt, which would both leak unrelated paths and invalidate the prompt
+cache. An earlier prototype used a fresh `/tmp/magpie-claude-*` on every run;
+that made a persisted inner session id impossible to resume after a gateway
+process restart.
+
+This is complementary to #626 rather than a replacement for it. #626 gives
+headless subscription runs one safe shared temp cwd so independent `claude -p`
+runs can reuse the common prompt prefix. The interactive backend cannot use one
+account-wide cwd for continuity: `--resume` is project/cwd scoped and each
+outer conversation must retain its own inner Claude session. Both therefore
+want stable temp paths, but at different granularities (shared for headless,
+per outer session for interactive).
 
 Before each resumed turn the persisted record is marked dirty. It becomes
 clean again only after a complete assistant turn is committed. A client or
 process abort in the middle of a turn therefore cannot silently resume a
 partially advanced inner transcript on the next request.
 
-This directly affects Anthropic prompt caching. In a VPS A/B smoke test with
-Haiku 4.5, the first turn created 7,176 cache tokens. After killing and
-restarting Magpie, the next turn restored the same inner Claude session and
-reported 7,176 cache-read tokens with only 109 new cache-write tokens. In the
-broken design, an inner-session reset rewrote the large prefix instead.
+This directly affects Anthropic prompt caching. In a VPS smoke test with Haiku
+4.5, the first turn created 6,474 cache tokens. After restarting Magpie, the
+next turn restored the same inner Claude session and reported 6,474 cache-read
+tokens with only 100 new cache-write tokens. In the broken design, an
+inner-session reset rewrote the large prefix instead.
 
 ## Long-thinking keepalive
 

@@ -20,18 +20,19 @@ var readsEnv = regexp.MustCompile(`(?:Getenv|LookupEnv|getenv)\("([A-Z][A-Z_0-9]
 // notAnAgent are the variables the same sources read that are not an agent's
 // folder, so no sandbox clears them through agentenv.Vars.
 var notAnAgent = map[string]string{
-	"APPDATA":               "Windows' own folder, which a sandbox sets to one of its own rather than clears",
-	"LOCALAPPDATA":          "the same",
-	"PATH":                  "the process' own",
-	"TZ":                    "the process' own",
-	"USER":                  "the process' own",
-	"XDG_CONFIG_HOME":       "magpie's own folder's, which appdir decides",
-	"XDG_DATA_HOME":         "the same",
-	"MAGPIE_ADDR":           "magpie's own",
-	"MAGPIE_DEBUG":          "magpie's own debug flag",
-	"MAGPIE_PUBLIC_URL":     "magpie's own public URL",
-	"MAGPIE_EFFORT_UPDATES": "magpie's own switch for effort updates (#617)",
-	"MAGPIE_SITE_ORIGIN":    "a site origin magpie's Omarchy theme answers, to try the site locally",
+	"APPDATA":                          "Windows' own folder, which a sandbox sets to one of its own rather than clears",
+	"LOCALAPPDATA":                     "the same",
+	"PATH":                             "the process' own",
+	"TZ":                               "the process' own",
+	"USER":                             "the process' own",
+	"XDG_CONFIG_HOME":                  "magpie's own folder's, which appdir decides",
+	"XDG_DATA_HOME":                    "the same",
+	"MAGPIE_ADDR":                      "magpie's own",
+	"MAGPIE_DEBUG":                     "magpie's own debug flag",
+	"MAGPIE_PUBLIC_URL":                "magpie's own public URL",
+	"MAGPIE_EFFORT_UPDATES":            "magpie's own switch for effort updates (#617)",
+	"MAGPIE_CLAUDE_INTERACTIVE_BRIDGE": "magpie's own opt-in Claude subscription transport, not an agent's folder",
+	"MAGPIE_SITE_ORIGIN":               "a site origin magpie's Omarchy theme answers, to try the site locally",
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "Claude Code's behaviour flag, not an agent's folder",
 }
 

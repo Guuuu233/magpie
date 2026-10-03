@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -37,10 +38,40 @@ func interactiveSessionStateKey(owner, outerSession string) string {
 }
 
 func interactiveSessionWorkDir(owner, outerSession string) (string, error) {
-	dir := filepath.Join(appdir.Cache(), "claude-interactive", interactiveSessionStateKey(owner, outerSession))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// Keep the cwd stable for this outer conversation, but outside the home:
+	// Claude Code includes git status for a repository containing its cwd in
+	// the system prompt, so a cache directory under a dotfiles-managed home can
+	// both leak unrelated paths and invalidate the prompt-cache prefix. This is
+	// the same concern addressed by #626 for headless subscription runs; the
+	// interactive backend needs a per-conversation directory because --resume
+	// resolves sessions by project/cwd.
+	dir := filepath.Join(os.TempDir(), "magpie-claude-interactive-"+interactiveSessionStateKey(owner, outerSession))
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
 		return "", err
 	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("%s is not a folder", dir)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("%s can be written by others (%v)", dir, fi.Mode().Perm())
+	}
+	// On a shared /tmp, a different user may have pre-created a 0700 path.
+	// Creating a file inside proves this process can actually own/use the cwd
+	// without platform-specific uid code; remove the probe immediately.
+	probe, err := os.CreateTemp(dir, ".magpie-owner-check-*")
+	if err != nil {
+		return "", fmt.Errorf("%s is not writable by this user: %w", dir, err)
+	}
+	probeName := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(probeName)
+		return "", err
+	}
+	_ = os.Remove(probeName)
 	return dir, nil
 }
 
