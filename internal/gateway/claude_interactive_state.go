@@ -205,6 +205,40 @@ func (b *subscriptionBridge) restoreInteractiveSession(owner, outerSession strin
 	}
 }
 
+// restoreInteractiveAuxiliarySession is the narrower restore used by Claude
+// Desktop's hidden prompt-suggestion request. That request deliberately has a
+// different system/tool surface from the visible conversation, so ContextKey
+// cannot match. It still must prove the exact completed visible reply from
+// which the auxiliary fork starts; otherwise it fails closed.
+func (b *subscriptionBridge) restoreInteractiveAuxiliarySession(owner, outerSession string, req *Request) (interactiveSessionEntry, []Message, interactiveRestoreStatus) {
+	saved, ok := b.interactiveSession(owner, outerSession)
+	if !ok {
+		return interactiveSessionEntry{}, nil, interactiveRestoreStateMissing
+	}
+	if saved.Dirty {
+		return saved, nil, interactiveRestoreDirty
+	}
+	since, status := conversationSuffixAfterDetailed(owner, req.Messages, saved.ConvKey)
+	switch status {
+	case conversationSuffixOK:
+		return saved, since, interactiveRestoreExact
+	case conversationSuffixRejected:
+		return saved, nil, interactiveRestoreSuffixRejected
+	}
+	if saved.ReplyKey == "" {
+		return saved, nil, interactiveRestoreCheckpointNotFound
+	}
+	since, status = conversationSuffixAfterReplyDetailed(req.Messages, saved.ReplyKey)
+	switch status {
+	case conversationSuffixOK:
+		return saved, since, interactiveRestoreReplyAnchor
+	case conversationSuffixRejected:
+		return saved, nil, interactiveRestoreSuffixRejected
+	default:
+		return saved, nil, interactiveRestoreCheckpointNotFound
+	}
+}
+
 // conversationSuffixAfter returns only what the caller said after a completed
 // assistant checkpoint already present in a persisted inner Claude session.
 // It deliberately refuses suffixes containing assistant/tool-result messages:

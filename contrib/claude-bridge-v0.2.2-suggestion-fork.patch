@@ -1,0 +1,99 @@
+diff --git a/src/transcript.ts b/src/transcript.ts
+--- a/src/transcript.ts
++++ b/src/transcript.ts
+@@ -159,0 +160,34 @@
++function transcriptUserText(row: TranscriptRow): string | undefined {
++  if (row.type !== "user") return undefined;
++  const message = (row as { message?: unknown }).message;
++  if (!message || typeof message !== "object") return undefined;
++  const content = (message as { content?: unknown }).content;
++  if (typeof content === "string") return content;
++  if (!Array.isArray(content)) return undefined;
++  const text = content
++    .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
++    .filter(part => part.type === "text" && typeof part.text === "string")
++    .map(part => part.text as string)
++    .join("");
++  return text || undefined;
++}
++
++/**
++ * A Claude --resume ... --fork-session transcript contains copied history
++ * before the newly submitted turn. Return only the final occurrence of that
++ * submitted user prompt and the rows after it, so compatibility output never
++ * replays inherited assistant/tool rows. null is fail-closed: without the
++ * submitted prompt there is no safe boundary between inherited and new rows.
++ */
++export function transcriptRowsFromLastUserPrompt(
++  rows: TranscriptRow[],
++  prompt: string
++): TranscriptRow[] | null {
++  let start = -1;
++  for (let i = 0; i < rows.length; i++) {
++    const text = transcriptUserText(rows[i]!);
++    if (text === prompt || text === "Human: " + prompt) start = i;
++  }
++  return start >= 0 ? rows.slice(start) : null;
++}
++
+diff --git a/src/test-transcript.ts b/src/test-transcript.ts
+--- a/src/test-transcript.ts
++++ b/src/test-transcript.ts
+@@ -16,0 +17 @@
++  transcriptRowsFromLastUserPrompt,
+@@ -131,0 +133,15 @@
++
++const forkRows: TranscriptRow[] = [
++  { type: "user", message: { role: "user", content: "old prompt" }, uuid: "old-user" },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "old answer" }] }, uuid: "old-assistant" },
++  { type: "user", message: { role: "user", content: "same prompt" }, uuid: "earlier-same" },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "earlier answer" }] }, uuid: "earlier-answer" },
++  { type: "user", message: { role: "user", content: "same prompt" }, uuid: "fork-user" },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "fork answer" }] }, uuid: "fork-assistant" },
++  { type: "system", subtype: "turn_duration", uuid: "fork-end" },
++];
++const currentForkRows = transcriptRowsFromLastUserPrompt(forkRows, "same prompt");
++ok("fork boundary uses the last matching user prompt", currentForkRows?.[0]?.uuid === "fork-user");
++ok("fork boundary drops copied assistant history", currentForkRows?.some(r => r.uuid === "old-assistant" || r.uuid === "earlier-answer") === false);
++ok("fork boundary keeps the new assistant reply", currentForkRows?.some(r => r.uuid === "fork-assistant") === true);
++ok("fork boundary fails closed when prompt is absent", transcriptRowsFromLastUserPrompt(forkRows, "missing prompt") === null);
+diff --git a/src/cli.ts b/src/cli.ts
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -28,0 +29 @@
++  transcriptRowsFromLastUserPrompt,
+@@ -153,0 +155 @@
++const forkedSession = Boolean(resumedSessionId && forwardedClaudeArgs.includes("--fork-session"));
+@@ -769,0 +772,6 @@
++function currentTurnTranscriptRows(rows: TranscriptRow[]): TranscriptRow[] | null {
++  if (!forkedSession) return rows;
++  if (!initialMessage) return null;
++  return transcriptRowsFromLastUserPrompt(rows, initialMessage);
++}
++
+@@ -775 +783,8 @@
+-    const rows = await readTranscript(transcriptPath);
++    const allRows = await readTranscript(transcriptPath);
++    const rows = currentTurnTranscriptRows(allRows);
++    if (!rows) {
++      pendingPrintFailure = {
++        message: "Fork transcript did not contain the submitted prompt; refusing inherited-history replay.",
++      };
++      return;
++    }
+@@ -779,0 +795 @@
++      inheritedRowsSkipped: allRows.length - rows.length,
+@@ -852 +868,7 @@
+-      emitClaudeStreamCatchUp(await readTranscript(stopEvent.transcript_path));
++      const allRows = await readTranscript(stopEvent.transcript_path);
++      const rows = currentTurnTranscriptRows(allRows);
++      if (!rows) {
++        failPrint("Fork transcript did not contain the submitted prompt; refusing inherited-history replay.");
++        return false;
++      }
++      emitClaudeStreamCatchUp(rows);
+@@ -1097,2 +1119,2 @@
+-      (resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
+-      (compatStreamJsonPrint ? await waitForRuntimeTranscriptPath(1_500) : null) ??
++      (!forkedSession && resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
++      (compatStreamJsonPrint && !forkedSession ? await waitForRuntimeTranscriptPath(1_500) : null) ??

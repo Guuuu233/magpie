@@ -116,6 +116,7 @@ type subscriptionRun struct {
 	interactive   bool
 	sessionID     string
 	outerSession  string
+	auxiliary     bool // hidden Desktop suggestion fork; never advances main state
 	binary        string
 	mcpConfig     string
 	toolsPath     string
@@ -359,13 +360,21 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	var bridgeImages map[string]Part
 	var resumeID string
 	var tools []bridgeTool
+	auxiliary := interactive && claudePromptSuggestion(req)
 	if interactive {
 		// A clean persisted mapping lets a gateway process restart reconnect the
 		// outer client conversation to the same real Claude session. Only the
 		// messages after the last completed assistant checkpoint are submitted;
 		// replaying the whole caller history would both duplicate context and
 		// destroy the prompt-cache prefix the inner session already owns.
-		saved, since, restore := b.restoreInteractiveSession(owner, outerSession, req)
+		var saved interactiveSessionEntry
+		var since []Message
+		var restore interactiveRestoreStatus
+		if auxiliary {
+			saved, since, restore = b.restoreInteractiveAuxiliarySession(owner, outerSession, req)
+		} else {
+			saved, since, restore = b.restoreInteractiveSession(owner, outerSession, req)
+		}
 		if outerSession != "" {
 			key := interactiveSessionStateKey(owner, outerSession)
 			if len(key) > 12 {
@@ -417,7 +426,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	}})
 	var args []string
 	if interactive {
-		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, resumeID)
+		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, resumeID, auxiliary && resumeID != "")
 	} else {
 		args = claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
 	}
@@ -453,7 +462,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 
 	run := &subscriptionRun{
 		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp,
-		interactive: interactive, sessionID: resumeID, outerSession: outerSession, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
+		interactive: interactive, sessionID: resumeID, outerSession: outerSession, auxiliary: auxiliary, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
 		persistentWork: persistentWork,
 		images:         bridgeImages,
 		pending:        map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
@@ -468,7 +477,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	b.mu.Lock()
 	b.runs[token] = run
 	b.mu.Unlock()
-	if interactive && resumeID != "" {
+	if interactive && resumeID != "" && !auxiliary {
 		b.markInteractiveSessionDirty(owner, outerSession)
 	}
 
@@ -619,7 +628,7 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string, imag
 	}
 	hasImages := len(r.images) > 0
 	r.mu.Unlock()
-	if r.outerSession != "" {
+	if r.outerSession != "" && !r.auxiliary {
 		r.bridge.markInteractiveSessionDirty(r.owner, r.outerSession)
 	}
 
@@ -638,7 +647,7 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string, imag
 	if err := os.WriteFile(toolsPath, toolBytes, 0o600); err != nil {
 		return nil, err
 	}
-	args := claudeInteractiveCLIArgs(model, mcpConfig, effort, req.WebSearch, sessionID)
+	args := claudeInteractiveCLIArgs(model, mcpConfig, effort, req.WebSearch, sessionID, false)
 	cmd := proc.CommandContext(context.Background(), binary, args...)
 	cmd.Dir = tmp
 	cmd.Env = env
@@ -720,6 +729,12 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	case r.stdin == nil && !r.interactive:
 		return // it ends by itself
 	case stop != "stop":
+		r.abort()
+		return
+	case r.auxiliary:
+		// Claude Desktop asks for a hidden next-prompt suggestion after a
+		// visible turn. It runs in a fork of the main inner session and must
+		// disappear here without becoming the main session's next checkpoint.
 		r.abort()
 		return
 	case len(req.Tools) == 0 && !hasReply(req.Messages):
@@ -948,7 +963,7 @@ func claudeCLIArgs(model, mcpConfig, effort string, web bool) []string {
 // desplega-ai/claude-bridge. Its own -p flag asks the wrapper for a
 // machine-readable compatibility stream; the wrapper must not forward -p or
 // other headless flags to the real Claude Code process it runs inside a PTY.
-func claudeInteractiveCLIArgs(model, mcpConfig, effort string, web bool, resume string) []string {
+func claudeInteractiveCLIArgs(model, mcpConfig, effort string, web bool, resume string, fork bool) []string {
 	own := ""
 	if web {
 		own = "WebSearch"
@@ -964,7 +979,31 @@ func claudeInteractiveCLIArgs(model, mcpConfig, effort string, web bool, resume 
 	if resume != "" {
 		args = append(args, "--resume", resume)
 	}
+	if fork {
+		args = append(args, "--fork-session")
+	}
 	return args
+}
+
+const claudePromptSuggestionPrefix = "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"
+
+// claudePromptSuggestion recognizes Claude Desktop/Code's hidden request for
+// the grey next-prompt suggestion shown after a visible answer. It shares the
+// outer conversation id, but is not part of that conversation's transcript.
+func claudePromptSuggestion(req *Request) bool {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		m := req.Messages[i]
+		if m.Role != "user" {
+			continue
+		}
+		for _, p := range m.Parts {
+			if p.Kind == Text && strings.HasPrefix(strings.TrimSpace(p.Text), claudePromptSuggestionPrefix) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // inClaudeDir is env for a Claude Code run on a saved account in use beside
@@ -2025,10 +2064,13 @@ func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request,
 			// the spent one in its Claude Code)
 			owner += "\x00" + ownHome
 		}
-		if run, events := s.subscription.resume(req, owner); run != nil {
-			return run, events, nil
+		auxiliary := claudePromptSuggestion(req)
+		if !auxiliary {
+			if run, events := s.subscription.resume(req, owner); run != nil {
+				return run, events, nil
+			}
+			s.subscription.retire(owner, req.Messages)
 		}
-		s.subscription.retire(owner, req.Messages)
 		if req.Effort == "" && autoModeClassifier(req) {
 			// Claude Code's auto mode classifier asks a verdict of a few
 			// words within a minute; a Claude Code run at its default

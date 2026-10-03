@@ -56,7 +56,7 @@ func TestClaudeCLIEffortXHigh(t *testing.T) {
 }
 
 func TestClaudeInteractiveBridgeArgsStayOutOfRealClaudeHeadlessMode(t *testing.T) {
-	args := claudeInteractiveCLIArgs("claude-opus-5-5", `{}`, "high", false, "session-123")
+	args := claudeInteractiveCLIArgs("claude-opus-5-5", `{}`, "high", false, "session-123", false)
 	joined := strings.Join(args, "\x00")
 	for _, forbidden := range []string{"--input-format\x00stream-json", "--include-partial-messages", "--no-session-persistence", "--thinking-display", "--setting-sources"} {
 		if strings.Contains(joined, forbidden) {
@@ -649,6 +649,135 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-p
 	}
 	if got := strings.Count(string(b), "args:"); got != 1 {
 		t.Fatalf("checkpoint miss started a second bridge and replayed history (%d calls):\n%s", got, b)
+	}
+}
+
+func TestClaudeInteractiveSuggestionForkDoesNotAdvanceMainSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	countPath := filepath.Join(dir, "count")
+	script := `#!/bin/sh
+n=0
+if [ -f "$FAKE_BRIDGE_COUNT" ]; then n=$(cat "$FAKE_BRIDGE_COUNT"); fi
+n=$((n+1))
+printf '%s' "$n" > "$FAKE_BRIDGE_COUNT"
+prompt=$(cat)
+printf 'call:%s args:%s stdin:%s\n' "$n" "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case "$n" in
+  1) sid=sess-main; text=VISIBLE_ONE ;;
+  2) sid=sess-fork; text=SUGGESTED_NEXT ;;
+  3) sid=sess-main; text=VISIBLE_TWO ;;
+  *) sid=sess-extra; text=EXTRA ;;
+esac
+printf '{"type":"assistant","session_id":"%s","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$sid" "$n" "$n" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","stop_reason":"end_turn","result":"%s"}\n' "$sid" "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	t.Setenv("FAKE_BRIDGE_COUNT", countPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	outer := "desktop-session-suggestion"
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+
+	// Use one server: the suggestion arrives while the visible main run is
+	// still parked in memory. It must not resume/advance that run.
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	ask := func(msgs string, suggestionMode bool) string {
+		t.Helper()
+		extra := `,"tools":[{"name":"read","input_schema":{"type":"object"}}]`
+		if suggestionMode {
+			// Desktop's hidden helper has a different system/tool surface from
+			// the visible conversation. It still forks from the visible reply.
+			extra = `,"system":"hidden prompt suggestion helper"`
+		}
+		body := `{"model":"claude-opus-5-5","max_tokens":100` + extra + `,"messages":` + msgs + `}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, outer)
+		rec := httptest.NewRecorder()
+		var u Usage
+		if code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+			t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			t.Fatalf("answer: %s (%v)", rec.Body, err)
+		}
+		return res.Content[0].Text
+	}
+
+	first := ask(`[`+msg("user", "hello")+`]`, false)
+	if first != "VISIBLE_ONE" {
+		t.Fatalf("first = %q", first)
+	}
+	owner := "claude\x00u\x00" + ownHome
+	beforeSuggestion, ok := s.subscription.interactiveSession(owner, outer)
+	if !ok {
+		t.Fatal("first visible turn did not persist its interactive session")
+	}
+	wantReplyKey := assistantReplyKey(Message{Role: "assistant", Parts: []Part{{Kind: Text, Text: first}}})
+	if beforeSuggestion.ReplyKey != wantReplyKey {
+		t.Fatalf("first visible reply key = %q, want %q", beforeSuggestion.ReplyKey, wantReplyKey)
+	}
+	suggestion := "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion."
+	suggestionBody := `{"model":"claude-opus-5-5","max_tokens":100,"system":"hidden prompt suggestion helper","messages":[` +
+		msg("user", "hello") + `,` + msg("assistant", first) + `,` + msg("user", suggestion) + `]}`
+	parsedSuggestion, err := parse(provider.Anthropic, []byte(suggestionBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := conversationSuffixAfterReply(parsedSuggestion.Messages, beforeSuggestion.ReplyKey); !ok || len(got) != 1 {
+		t.Fatalf("parsed suggestion lost visible reply anchor: messages=%#v suffix=%#v ok=%v", parsedSuggestion.Messages, got, ok)
+	}
+	s.subscription.mu.Lock()
+	idleN := len(s.subscription.idle)
+	s.subscription.mu.Unlock()
+	if idleN == 0 {
+		t.Fatal("visible main run was not parked before suggestion")
+	}
+	suggested := ask(`[`+msg("user", "hello")+`,`+msg("assistant", first)+`,`+msg("user", suggestion)+`]`, true)
+	if suggested != "SUGGESTED_NEXT" {
+		t.Fatalf("suggestion = %q", suggested)
+	}
+	third := ask(`[`+msg("user", "hello")+`,`+msg("assistant", first)+`,`+msg("user", "real next turn")+`]`, false)
+	if third != "VISIBLE_TWO" {
+		t.Fatalf("third = %q", third)
+	}
+
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(b)
+	if got := strings.Count(log, "call:"); got != 3 {
+		t.Fatalf("bridge calls = %d:\n%s", got, b)
+	}
+	secondCall := log[strings.Index(log, "call:2 "):]
+	thirdAt := strings.Index(secondCall, "call:3 ")
+	if thirdAt < 0 {
+		t.Fatalf("missing third bridge call:\n%s", log)
+	}
+	secondCall, thirdCall := secondCall[:thirdAt], secondCall[thirdAt:]
+	if !strings.Contains(secondCall, "--resume sess-main") || !strings.Contains(secondCall, "--fork-session") {
+		t.Fatalf("suggestion did not fork from main session:\n%s", secondCall)
+	}
+	if !strings.Contains(thirdCall, "--resume sess-main") || strings.Contains(thirdCall, "sess-fork") || strings.Contains(thirdCall, "--fork-session") {
+		t.Fatalf("real next turn no longer resumed main session:\n%s", thirdCall)
+	}
+	saved, ok := s.subscription.interactiveSession(owner, outer)
+	if !ok || saved.SessionID != "sess-main" {
+		t.Fatalf("persisted main session advanced to suggestion fork: %#v, %v", saved, ok)
 	}
 }
 
