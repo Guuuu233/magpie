@@ -363,6 +363,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		// replaying the whole caller history would both duplicate context and
 		// destroy the prompt-cache prefix the inner session already owns.
 		saved, since, restore := b.restoreInteractiveSession(owner, outerSession, req)
+		contextChanged := saved.SessionID != "" && saved.ContextKey != "" && saved.ContextKey != turnKey(owner, req, nil)
 		if outerSession != "" {
 			key := interactiveSessionStateKey(owner, outerSession)
 			if len(key) > 12 {
@@ -374,6 +375,9 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 			case interactiveRestoreReplyAnchor:
 				log.Printf("Claude interactive persisted resume recovered: reason=%s session=%s", restore, key)
 			case interactiveRestoreExact:
+				if contextChanged {
+					log.Printf("Claude interactive persisted resume recovered: reason=context_changed session=%s", key)
+				}
 			default:
 				log.Printf("Claude interactive persisted resume refused: reason=%s session=%s", restore, key)
 			}
@@ -381,6 +385,9 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		switch restore {
 		case interactiveRestoreExact, interactiveRestoreReplyAnchor:
 			bridgePrompt, bridgeImages, err = renderClaudeBridgeTurnWithImages(since)
+			if err == nil && contextChanged {
+				bridgePrompt = renderClaudeInteractiveContextRefresh(req) + bridgePrompt
+			}
 			resumeID = saved.SessionID
 		case interactiveRestoreStateMissing:
 			bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
@@ -1457,17 +1464,7 @@ func (u cliUsage) gateway() Usage {
 func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 	var blocks []map[string]any
 	var text strings.Builder
-	if req.System != "" || req.ToolChoice == "required" || strings.HasPrefix(req.ToolChoice, "name:") {
-		text.WriteString("<external_system_instructions>\n")
-		text.WriteString(req.System)
-		switch {
-		case req.ToolChoice == "required":
-			text.WriteString("\nYou must call at least one available tool before answering.")
-		case strings.HasPrefix(req.ToolChoice, "name:"):
-			fmt.Fprintf(&text, "\nYou must call the %s tool.", strings.TrimPrefix(req.ToolChoice, "name:"))
-		}
-		text.WriteString("\n</external_system_instructions>\n\n")
-	}
+	text.WriteString(renderClaudeExternalInstructions(req))
 	for _, m := range req.Messages {
 		label := "Human"
 		if m.Role == "assistant" {
@@ -1478,6 +1475,36 @@ func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 		text.WriteString("\n\n")
 	}
 	return closeBlocks(blocks, &text), nil
+}
+
+func renderClaudeExternalInstructions(req *Request) string {
+	if req.System == "" && req.ToolChoice != "required" && !strings.HasPrefix(req.ToolChoice, "name:") {
+		return ""
+	}
+	var text strings.Builder
+	text.WriteString("<external_system_instructions>\n")
+	text.WriteString(req.System)
+	switch {
+	case req.ToolChoice == "required":
+		text.WriteString("\nYou must call at least one available tool before answering.")
+	case strings.HasPrefix(req.ToolChoice, "name:"):
+		fmt.Fprintf(&text, "\nYou must call the %s tool.", strings.TrimPrefix(req.ToolChoice, "name:"))
+	}
+	text.WriteString("\n</external_system_instructions>\n\n")
+	return text.String()
+}
+
+func renderClaudeInteractiveContextRefresh(req *Request) string {
+	var text strings.Builder
+	text.WriteString("<external_context_refresh>\n")
+	text.WriteString("The outer client context changed since the previous turn. The current MCP tool set, response constraints, model settings, and external instructions supersede the previous outer-client context. Continue the existing conversation without replaying prior history.\n")
+	if current := renderClaudeExternalInstructions(req); current != "" {
+		text.WriteString(current)
+	} else {
+		text.WriteString("There are no current external system instructions.\n")
+	}
+	text.WriteString("</external_context_refresh>\n\n")
+	return text.String()
 }
 
 // renderClaudeBridgePrompt flattens a prompt for the experimental interactive

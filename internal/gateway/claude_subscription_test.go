@@ -766,8 +766,8 @@ func TestClaudeInteractiveRestoreReasons(t *testing.T) {
 	b.saveInteractiveSession(owner, "context", interactiveSessionEntry{
 		SessionID: "sess-context", ConvKey: keys[0], ReplyKey: replyKey, ContextKey: "different",
 	})
-	if _, _, got := b.restoreInteractiveSession(owner, "context", &missingReq); got != interactiveRestoreContextMismatch {
-		t.Fatalf("context mismatch reason = %q", got)
+	if _, since, got := b.restoreInteractiveSession(owner, "context", &missingReq); got != interactiveRestoreExact || len(since) != 1 || since[0].Parts[0].Text != "and?" {
+		t.Fatalf("context change should preserve exact history continuity: status=%q suffix=%#v", got, since)
 	}
 
 	b.saveInteractiveSession(owner, "checkpoint", interactiveSessionEntry{
@@ -784,6 +784,17 @@ func TestClaudeInteractiveRestoreReasons(t *testing.T) {
 	suffixReq.Messages = append(slices.Clone(base), Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "toolu_1", Text: "old tool output"}}})
 	if _, _, got := b.restoreInteractiveSession(owner, "suffix", &suffixReq); got != interactiveRestoreSuffixRejected {
 		t.Fatalf("suffix rejected reason = %q", got)
+	}
+}
+
+func TestClaudeInteractiveContextRefreshCarriesCurrentInstructionsOnly(t *testing.T) {
+	req := &Request{System: "CURRENT_SYSTEM", ToolChoice: "required"}
+	got := renderClaudeInteractiveContextRefresh(req)
+	if !strings.Contains(got, "CURRENT_SYSTEM") || !strings.Contains(got, "must call at least one available tool") {
+		t.Fatalf("context refresh lost current instructions: %q", got)
+	}
+	if !strings.Contains(got, "supersede") || !strings.Contains(got, "without replaying prior history") {
+		t.Fatalf("context refresh does not clearly replace prior outer context: %q", got)
 	}
 }
 

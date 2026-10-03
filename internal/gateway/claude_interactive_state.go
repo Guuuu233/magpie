@@ -212,9 +212,6 @@ func (b *subscriptionBridge) restoreInteractiveSession(owner, outerSession strin
 	if saved.Dirty {
 		return saved, nil, interactiveRestoreDirty
 	}
-	if saved.ContextKey != turnKey(owner, req, nil) {
-		return saved, nil, interactiveRestoreContextMismatch
-	}
 	since, status := conversationSuffixAfterDetailed(owner, req.Messages, saved.ConvKey)
 	switch status {
 	case conversationSuffixOK:
