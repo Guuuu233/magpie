@@ -55,6 +55,339 @@ func TestClaudeCLIEffortXHigh(t *testing.T) {
 	}
 }
 
+func TestClaudeInteractiveBridgeArgsStayOutOfRealClaudeHeadlessMode(t *testing.T) {
+	args := claudeInteractiveCLIArgs("claude-opus-5-5", `{}`, "high", false, "session-123")
+	joined := strings.Join(args, "\x00")
+	for _, forbidden := range []string{"--input-format\x00stream-json", "--include-partial-messages", "--no-session-persistence", "--thinking-display", "--setting-sources"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("interactive bridge args contain headless-only option %q: %q", forbidden, args)
+		}
+	}
+	for _, want := range []string{"-p", "--output-format", "stream-json", "--model", "claude-opus-5-5", "--effort", "high", "--resume", "session-123", "--strict-mcp-config", "--mcp-config"} {
+		if !slices.Contains(args, want) {
+			t.Fatalf("interactive bridge args missing %q: %q", want, args)
+		}
+	}
+}
+
+func TestClaudeSubscriptionBinaryUsesConfiguredInteractiveBridge(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("executable test uses unix file mode")
+	}
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	if err := os.WriteFile(bridge, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	got, interactive, err := claudeSubscriptionBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != bridge || !interactive {
+		t.Fatalf("binary = %q, interactive=%v; want %q, true", got, interactive, bridge)
+	}
+}
+
+func TestClaudeInteractiveBridgeReadsWholeAssistantMessage(t *testing.T) {
+	run := &subscriptionRun{interactive: true}
+	seg := run.attach()
+	lines := []string{
+		`{"type":"assistant","session_id":"sess-1","request_id":"req-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1","result":"hello"}`,
+	}
+	go run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	var got []string
+	var usage Usage
+	for ev := range seg {
+		switch ev.Kind {
+		case KStart:
+			got = append(got, "start:"+ev.MsgID+":"+ev.Model)
+			usage.add(ev.Usage)
+		case KText:
+			got = append(got, "text:"+ev.Text)
+		case KUsage:
+			usage.add(ev.Usage)
+		case KStop:
+			got = append(got, "stop:"+ev.Stop)
+		}
+	}
+	if s := strings.Join(got, "|"); s != "start:m1:claude-opus-5-5|text:hello|stop:stop" {
+		t.Fatalf("events: %s", s)
+	}
+	if usage.Input != 2 || usage.Output != 3 {
+		t.Fatalf("usage: %+v", usage)
+	}
+	if run.sessionID != "sess-1" {
+		t.Fatalf("session id = %q", run.sessionID)
+	}
+}
+
+// Interactive Claude writes one transcript row per content block. Thinking
+// and visible text can therefore share the same Anthropic message id while
+// carrying different transcript UUIDs. The bridge must keep both blocks but
+// count the message usage only once.
+func TestClaudeInteractiveBridgeKeepsMultipleRowsOfOneAssistantMessage(t *testing.T) {
+	run := &subscriptionRun{interactive: true}
+	seg := run.attach()
+	lines := []string{
+		`{"type":"assistant","uuid":"row-think","session_id":"sess-1","request_id":"req-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"thinking","thinking":"reason"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":5,"output_tokens_details":{"thinking_tokens":3}}}}`,
+		`{"type":"assistant","uuid":"row-text","session_id":"sess-1","request_id":"req-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":5,"output_tokens_details":{"thinking_tokens":3}}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1","stop_reason":"end_turn","result":"answer"}`,
+	}
+	go run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	var got []string
+	var usage Usage
+	for ev := range seg {
+		switch ev.Kind {
+		case KStart:
+			got = append(got, "start:"+ev.MsgID)
+			usage.add(ev.Usage)
+		case KThink:
+			got = append(got, "think:"+ev.Text)
+		case KText:
+			got = append(got, "text:"+ev.Text)
+		case KStop:
+			got = append(got, "stop:"+ev.Stop)
+		}
+	}
+	if s := strings.Join(got, "|"); s != "start:m1|think:reason|text:answer|stop:stop" {
+		t.Fatalf("events: %s", s)
+	}
+	if usage.Input != 2 || usage.Output != 5 || usage.Reasoning != 3 {
+		t.Fatalf("usage counted more than once: %+v", usage)
+	}
+}
+
+func TestClaudeInteractiveBridgeReturnsExternalToolCallBeforeTurnEnds(t *testing.T) {
+	run := &subscriptionRun{interactive: true}
+	seg := run.attach()
+	line := `{"type":"assistant","session_id":"sess-tool","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__magpie__read","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":7}}}`
+	done := make(chan struct{})
+	go func() {
+		run.readOutput(strings.NewReader(line + "\n"))
+		close(done)
+	}()
+	var got []string
+	for ev := range seg {
+		switch ev.Kind {
+		case KToolStart:
+			got = append(got, "tool:"+ev.ID+":"+ev.Name)
+		case KToolArgs:
+			got = append(got, "args:"+ev.Text)
+		case KStop:
+			got = append(got, "stop:"+ev.Stop)
+		}
+	}
+	<-done
+	if s := strings.Join(got, "|"); s != `tool:toolu_1:read|args:{"path":"a.txt"}|stop:tool` {
+		t.Fatalf("events: %s", s)
+	}
+	if len(run.asked) != 1 || run.asked[0] != "read" {
+		t.Fatalf("asked: %v", run.asked)
+	}
+}
+
+func TestClaudeInteractiveBridgeErrorResultUsesBridgeErrorMessage(t *testing.T) {
+	run := &subscriptionRun{interactive: true}
+	seg := run.attach()
+	line := `{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":429,"error":"interactive quota error","result":null}`
+	go run.readOutput(strings.NewReader(line + "\n"))
+	var got Event
+	for ev := range seg {
+		if ev.Kind == KError {
+			got = ev
+		}
+	}
+	if got.Text != "interactive quota error" || got.Status != 429 {
+		t.Fatalf("error event: %+v", got)
+	}
+}
+
+func TestClaudeSubscriptionInteractiveBridgeHandlesFirstTurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell scripts stand in for Claude binaries")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "bridge.log")
+	bridge := filepath.Join(dir, "claude-bridge")
+	bridgeScript := `#!/bin/sh
+printf 'args:%s\n' "$*" >> "$FAKE_BRIDGE_LOG"
+printf 'stdin:' >> "$FAKE_BRIDGE_LOG"
+cat | tee -a "$FAKE_BRIDGE_LOG" >/dev/null
+printf '\n' >> "$FAKE_BRIDGE_LOG"
+echo '{"type":"assistant","session_id":"sess-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"interactive-ok"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1","result":"interactive-ok"}'
+`
+	if err := os.WriteFile(bridge, []byte(bridgeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// If the old headless path is used, fail the request immediately instead
+	// of ever reaching a real Claude installation on the developer machine.
+	headless := filepath.Join(dir, "claude")
+	if err := os.WriteFile(headless, []byte("#!/bin/sh\necho '{\"type\":\"result\",\"is_error\":true,\"result\":\"headless-called\"}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	body := `{"model":"claude-opus-5-5","max_tokens":100,"system":"be brief","tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hello"}]}`
+	rec := httptest.NewRecorder()
+	var u Usage
+	code, msg := s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u)
+	if code != 200 {
+		t.Fatalf("%d %s: %s", code, msg, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "interactive-ok") {
+		t.Fatalf("answer: %s", rec.Body)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(b)
+	if !strings.Contains(log, "args:-p --output-format stream-json") || !strings.Contains(log, "--model claude-opus-5-5") {
+		t.Fatalf("bridge args not used:\n%s", log)
+	}
+	if !strings.Contains(log, "stdin:<external_system_instructions>") || !strings.Contains(log, "Human: hello") {
+		t.Fatalf("rendered prompt not piped to bridge:\n%s", log)
+	}
+}
+
+func TestClaudeInteractiveOneOffLetsBridgeCleanDetachedChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script and setsid stand in for an interactive PTY bridge")
+	}
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	childPID := filepath.Join(dir, "child.pid")
+	script := `#!/bin/sh
+cleanup() {
+  if [ -f "$FAKE_CHILD_PID" ]; then kill "$(cat "$FAKE_CHILD_PID")" 2>/dev/null || true; fi
+  exit 0
+}
+trap cleanup INT TERM
+python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(60)' "$FAKE_CHILD_PID" &
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -s "$FAKE_CHILD_PID" ] && break
+  sleep 0.01
+done
+cat >/dev/null
+echo '{"type":"assistant","session_id":"sess-oneoff","uuid":"row-oneoff","message":{"id":"m-oneoff","model":"claude-opus-5-5","content":[{"type":"text","text":"ONEOFF_OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-oneoff","stop_reason":"end_turn","result":"ONEOFF_OK"}'
+while :; do sleep 0.05; done
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_CHILD_PID", childPID)
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	body := `{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"one off"}]}`
+	rec := httptest.NewRecorder()
+	var u Usage
+	if code, msg := s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+		t.Fatalf("%d %s: %s", code, msg, rec.Body.String())
+	}
+	var pid int
+	for deadline := time.Now().Add(2 * time.Second); pid == 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		b, _ := os.ReadFile(childPID)
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+	}
+	if pid == 0 {
+		t.Fatal("fake bridge did not start detached child")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(pid); err == nil {
+			_ = p.Kill()
+		}
+	})
+	if n := leftover([]int{pid}, 2*time.Second); n != 0 {
+		t.Fatalf("interactive bridge detached child survived one-off cleanup (pid %d)", pid)
+	}
+}
+
+func TestClaudeSubscriptionInteractiveBridgeResumesNextTurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	countPath := filepath.Join(dir, "count")
+	script := `#!/bin/sh
+n=0
+if [ -f "$FAKE_BRIDGE_COUNT" ]; then n=$(cat "$FAKE_BRIDGE_COUNT"); fi
+n=$((n+1))
+printf '%s' "$n" > "$FAKE_BRIDGE_COUNT"
+prompt=$(cat)
+printf 'call:%s args:%s stdin:%s\n' "$n" "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+if [ "$n" -eq 1 ]; then text=turn1; else text=turn2; fi
+if [ "$n" -gt 1 ]; then
+  printf '{"type":"assistant","session_id":"sess-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"turn1"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n'
+fi
+printf '{"type":"assistant","session_id":"sess-1","message":{"id":"m%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$n" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1","result":"%s"}\n' "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	t.Setenv("FAKE_BRIDGE_COUNT", countPath)
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	ask := func(msgs string) string {
+		t.Helper()
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":` + msgs + `}`
+		rec := httptest.NewRecorder()
+		var u Usage
+		if code, msg := s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+			t.Fatalf("%d %s: %s", code, msg, rec.Body.String())
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			t.Fatalf("answer: %s (%v)", rec.Body, err)
+		}
+		return res.Content[0].Text
+	}
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+
+	first := ask(`[` + msg("user", "hello") + `]`)
+	if first != "turn1" {
+		t.Fatalf("first = %q", first)
+	}
+	second := ask(`[` + msg("user", "hello") + `,` + msg("assistant", first) + `,` + msg("user", "and?") + `]`)
+	if second != "turn2" {
+		t.Fatalf("second = %q", second)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("bridge calls:\n%s", b)
+	}
+	if !strings.Contains(lines[1], "--resume sess-1") {
+		t.Fatalf("second turn did not resume the interactive Claude session:\n%s", b)
+	}
+	if !strings.Contains(lines[1], "stdin:and?") || strings.Contains(lines[1], "turn1") || strings.Contains(lines[1], "Human: hello") {
+		t.Fatalf("second turn should send only the new user text:\n%s", b)
+	}
+}
+
 func TestCleanClaudeEnvRemovesGatewayOverrides(t *testing.T) {
 	got := cleanClaudeEnv([]string{
 		"PATH=/bin", "ANTHROPIC_BASE_URL=http://127.0.0.1:3425",

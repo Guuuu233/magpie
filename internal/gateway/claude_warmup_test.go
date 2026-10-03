@@ -67,6 +67,45 @@ func TestWarmClaudeAsksClaudeCodeOnce(t *testing.T) {
 	}
 }
 
+func TestWarmClaudeUsesInteractiveBridgeWhenConfigured(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell scripts stand in for Claude binaries")
+	}
+	dir := t.TempDir()
+	log := filepath.Join(dir, "bridge.log")
+	bridge := filepath.Join(dir, "claude-bridge")
+	bridgeScript := `#!/bin/sh
+{ printf 'args:'; for a in "$@"; do printf '[%s]' "$a"; done; echo; printf 'stdin:'; cat; echo; } > "$FAKE_BRIDGE_LOG"
+echo '{"type":"result","is_error":false,"result":"Hi!"}'
+`
+	if err := os.WriteFile(bridge, []byte(bridgeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Raw Claude must not be used for a model-bearing warmup when the
+	// interactive backend is configured.
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\necho raw-claude-called >&2\nexit 7\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", log)
+	if err := warmClaude(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(log)
+	got := string(b)
+	for _, want := range []string{"[-p]", "[--output-format][json]", "[--model][haiku]", "stdin:hi"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("interactive warmup lacks %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"[--setting-sources]", "[--no-session-persistence]"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("interactive warmup contains %q:\n%s", forbidden, got)
+		}
+	}
+}
+
 func TestWarmClaudeSaysWhyNot(t *testing.T) {
 	fakeWarmClaude(t, `{"type":"result","is_error":true,"result":"Invalid API key · Please run /login"}`, 1)
 	err := warmClaude(context.Background(), "")

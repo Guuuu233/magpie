@@ -37,7 +37,7 @@ func warmClaude(ctx context.Context, configDir string) error {
 // it is how a Claude account's model test runs (provider.ProbeClaudeVia),
 // so the test asks Anthropic as Claude Code does, through Claude Code.
 func askClaude(ctx context.Context, configDir, model string) error {
-	binary, err := claudeBinary()
+	binary, interactive, err := claudeSubscriptionBinary()
 	if err != nil {
 		return err
 	}
@@ -46,7 +46,11 @@ func askClaude(ctx context.Context, configDir, model string) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	cmd := proc.CommandContext(ctx, binary, claudeWarmArgs(model)...)
+	args := claudeWarmArgs(model)
+	if interactive {
+		args = claudeInteractiveWarmArgs(model)
+	}
+	cmd := proc.CommandContext(ctx, binary, args...)
 	cmd.Dir = tmp
 	cmd.Stdin = strings.NewReader("hi")
 	cmd.Env = netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
@@ -158,6 +162,16 @@ func claudeUsageArgs() []string {
 func claudeWarmArgs(model string) []string {
 	return []string{"-p", "--output-format", "json", "--model", model,
 		"--tools", "", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence"}
+}
+
+// claudeInteractiveWarmArgs asks the configured interactive wrapper for a
+// one-turn JSON result. The wrapper owns -p; it must keep the real Claude Code
+// process inside a PTY and must not forward headless-only settings such as
+// --setting-sources or --no-session-persistence, because its Stop hook lives
+// in the local settings it creates for the temporary workdir.
+func claudeInteractiveWarmArgs(model string) []string {
+	return []string{"-p", "--output-format", "json", "--model", model,
+		"--tools", "", "--strict-mcp-config"}
 }
 
 func clip(s string) string {

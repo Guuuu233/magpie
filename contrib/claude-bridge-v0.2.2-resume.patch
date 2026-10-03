@@ -1,0 +1,65 @@
+diff --git a/src/args.ts b/src/args.ts
+index 55b1b6b..cfbc33d 100644
+--- a/src/args.ts
++++ b/src/args.ts
+@@ -296,0 +297,17 @@ export function formatClaudeHelp(claudeHelp: string): string {
++// Return an explicit Claude session id passed to --resume/-r. A bare resume
++// asks Claude Code to choose a session itself, which is not deterministic
++// enough for the bridge to locate the existing transcript before launch.
++export function claudeResumeSessionId(args: string[]): string | undefined {
++  for (let i = 0; i < args.length; i++) {
++    const arg = args[i]!;
++    if (arg.startsWith("--resume=")) {
++      return arg.slice("--resume=".length) || undefined;
++    }
++    if (arg === "--resume" || arg === "-r") {
++      const next = args[i + 1];
++      return next && !looksLikeOption(next) ? next : undefined;
++    }
++  }
++  return undefined;
++}
++
+diff --git a/src/cli.ts b/src/cli.ts
+index 1673770..50d5ad9 100755
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -23,0 +24 @@ import {
++  findTranscriptBySessionId,
+@@ -36 +37 @@ import { formatEnvelope } from "./view.ts";
+-import { formatClaudeHelp, formatWrapperHelp, parseCliArgs, type OutputFormat } from "./args.ts";
++import { claudeResumeSessionId, formatClaudeHelp, formatWrapperHelp, parseCliArgs, type OutputFormat } from "./args.ts";
+@@ -151,0 +153 @@ const forwardedClaudeArgs = jsonSchema
++const resumedSessionId = claudeResumeSessionId(forwardedClaudeArgs);
+@@ -1044,0 +1047 @@ async function startTranscriptTail(): Promise<void> {
++      (resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
+@@ -1204,2 +1206,0 @@ function startRepl(): void {
+-  process.on("SIGINT", () => shutdown());
+-  process.on("SIGTERM", () => shutdown());
+@@ -1221,0 +1223,5 @@ desplegaDebug("run state created", { runDir });
++// Print mode is also a long-lived wrapper while Claude is waiting on MCP
++// tools. Handle termination in every mode so Magpie can ask the wrapper to
++// tear down the detached tmux/PTY before falling back to a hard process kill.
++process.on("SIGINT", () => shutdown());
++process.on("SIGTERM", () => shutdown());
+diff --git a/src/transcript.ts b/src/transcript.ts
+index f1e9480..cc4a298 100644
+--- a/src/transcript.ts
++++ b/src/transcript.ts
+@@ -89,0 +90,16 @@ export async function listAllTranscriptPaths(root: string = claudeProjectsRoot()
++/**
++ * Locate an existing transcript by Claude session id. Resume mode appends to
++ * the same JSONL file rather than creating a fresh one, so discovery based on
++ * a pre-launch snapshot cannot find it reliably.
++ */
++export async function findTranscriptBySessionId(
++  sessionId: string,
++  root: string = claudeProjectsRoot()
++): Promise<string | null> {
++  const name = `${sessionId}.jsonl`;
++  for (const path of await listAllTranscriptPaths(root)) {
++    if (basename(path) === name) return path;
++  }
++  return null;
++}
++

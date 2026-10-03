@@ -104,6 +104,20 @@ type subscriptionRun struct {
 	tree   *proc.Tree // cmd once started, with all it starts
 	tmp    string
 
+	// interactive is an experimental transport in which an outer bridge
+	// drives the real Claude Code TUI inside a PTY. sessionID is the Claude
+	// session the bridge reports, used to resume the next turn.
+	interactive   bool
+	sessionID     string
+	binary        string
+	mcpConfig     string
+	toolsPath     string
+	env           []string
+	turnDone      chan struct{}
+	outputDone    chan struct{}
+	seenAssistant map[string]bool
+	seenRows      map[string]bool
+
 	// the tools its agent was told of, as it started and since
 	tools map[string]bool
 
@@ -256,6 +270,32 @@ func claudeBinary() (string, error) {
 	return "", errors.New("Claude Code is not installed; install it and run `claude auth login`")
 }
 
+// claudeSubscriptionBinary returns the executable used by the Claude
+// subscription transport. The default remains the genuine Claude Code binary.
+// Setting MAGPIE_CLAUDE_INTERACTIVE_BRIDGE opts into an experimental bridge
+// executable that must itself keep the real Claude Code process interactive.
+func claudeSubscriptionBinary() (path string, interactive bool, err error) {
+	if bridge := strings.TrimSpace(os.Getenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE")); bridge != "" {
+		if strings.ContainsRune(bridge, os.PathSeparator) {
+			st, statErr := os.Stat(bridge)
+			if statErr != nil {
+				return "", true, fmt.Errorf("Claude interactive bridge %q: %w", bridge, statErr)
+			}
+			if st.IsDir() || st.Mode()&0o111 == 0 {
+				return "", true, fmt.Errorf("Claude interactive bridge %q is not executable", bridge)
+			}
+			return bridge, true, nil
+		}
+		p, lookErr := exec.LookPath(bridge)
+		if lookErr != nil {
+			return "", true, fmt.Errorf("Claude interactive bridge %q: %w", bridge, lookErr)
+		}
+		return p, true, nil
+	}
+	p, err := claudeBinary()
+	return p, false, err
+}
+
 func callbackBaseURL() string {
 	a := Addr()
 	host, port, ok := strings.Cut(a, ":")
@@ -269,7 +309,7 @@ func callbackBaseURL() string {
 }
 
 func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, configDir, owner string) (*subscriptionRun, <-chan Event, error) {
-	binary, err := claudeBinary()
+	binary, interactive, err := claudeSubscriptionBinary()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -297,15 +337,36 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	mcpConfig, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
 		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callback, toolsPath}},
 	}})
-	args := claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
+	var args []string
+	var bridgePrompt string
+	if interactive {
+		bridgePrompt, err = renderClaudeBridgePrompt(req)
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, "")
+	} else {
+		args = claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
+	}
 	cmd := proc.CommandContext(context.Background(), binary, args...)
 	cmd.Dir = tmp
-	cmd.Env = netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
-	cmd.Env = inClaudeDir(cmd.Env, configDir)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		cleanup()
-		return nil, nil, err
+	env := netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
+	env = inClaudeDir(env, configDir)
+	cmd.Env = env
+	var stdin io.WriteCloser
+	if interactive {
+		// claude-bridge print mode reads the complete prompt from stdin before
+		// it starts the real interactive Claude TUI. Give it a finite reader so
+		// EOF is immediate; tool results travel through Magpie's MCP callback,
+		// not this stdin.
+		cmd.Stdin = strings.NewReader(bridgePrompt)
+	} else {
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -318,7 +379,14 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		return nil, nil, err
 	}
 
-	run := &subscriptionRun{bridge: b, token: token, model: model, cmd: cmd, tmp: tmp, pending: map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort}
+	run := &subscriptionRun{
+		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp,
+		interactive: interactive, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
+		pending: map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
+	}
+	if interactive {
+		run.outputDone = make(chan struct{})
+	}
 	// A caller may abandon a turn after receiving tool_use. Do not leave the
 	// parked Claude process and MCP request alive forever.
 	run.timer = time.AfterFunc(30*time.Minute, run.abort)
@@ -334,17 +402,26 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	go func() {
 		_, _ = io.Copy(&lockedWriter{run: run}, io.LimitReader(stderr, 1<<20))
 	}()
-	go run.readOutput(stdout)
-
-	prompt, err := renderClaudePrompt(req)
-	if err != nil {
-		run.abort()
-		return nil, nil, err
+	if interactive {
+		go func(done chan struct{}) {
+			run.readOutput(stdout)
+			close(done)
+		}(run.outputDone)
+	} else {
+		go run.readOutput(stdout)
 	}
-	line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": prompt}})
-	if _, err := stdin.Write(append(line, '\n')); err != nil {
-		run.abort()
-		return nil, nil, err
+
+	if !interactive {
+		prompt, err := renderClaudePrompt(req)
+		if err != nil {
+			run.abort()
+			return nil, nil, err
+		}
+		line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": prompt}})
+		if _, err := stdin.Write(append(line, '\n')); err != nil {
+			run.abort()
+			return nil, nil, err
+		}
 	}
 	return run, segment, nil
 }
@@ -377,6 +454,28 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	b.mu.Unlock()
 	if run == nil {
 		return nil, nil
+	}
+	if run.interactive {
+		// The PTY bridge starts one wrapper process per turn and resumes the
+		// same real Claude session. Dynamic effort changes are deliberately
+		// outside the first experimental scope: restart from the full caller
+		// conversation instead of pretending the interactive TUI accepted the
+		// headless SDK control message.
+		if req.Effort != run.effort {
+			run.abort()
+			return nil, nil
+		}
+		prompt, err := renderClaudeBridgeTurn(since)
+		if err != nil {
+			run.abort()
+			return nil, nil
+		}
+		ch, err := run.startInteractiveTurn(req, prompt)
+		if err != nil {
+			run.abort()
+			return nil, nil
+		}
+		return run, ch
 	}
 	line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": renderClaudeTurn(since)}})
 	run.mu.Lock()
@@ -419,6 +518,88 @@ func (r *subscriptionRun) setEffort(effort string) error {
 	return nil
 }
 
+// startInteractiveTurn starts the next wrapper process for a conversation
+// whose real Claude session lives in the interactive PTY bridge. The wrapper
+// is intentionally one-shot; --resume reconnects the new PTY to the same
+// Claude session while Magpie keeps the logical run and MCP callback token.
+func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string) (<-chan Event, error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.New("Claude interactive run is closed")
+	}
+	previous := r.turnDone
+	sessionID := r.sessionID
+	binary := r.binary
+	mcpConfig := r.mcpConfig
+	model := r.model
+	tmp := r.tmp
+	toolsPath := r.toolsPath
+	env := slices.Clone(r.env)
+	effort := r.effort
+	r.mu.Unlock()
+
+	if sessionID == "" {
+		return nil, errors.New("Claude interactive bridge returned no session id to resume")
+	}
+	if previous != nil {
+		select {
+		case <-previous:
+		case <-time.After(5 * time.Second):
+			return nil, errors.New("previous Claude interactive bridge turn did not exit")
+		}
+	}
+
+	toolBytes, _ := json.Marshal(bridgeTools(req))
+	if err := os.WriteFile(toolsPath, toolBytes, 0o600); err != nil {
+		return nil, err
+	}
+	args := claudeInteractiveCLIArgs(model, mcpConfig, effort, req.WebSearch, sessionID)
+	cmd := proc.CommandContext(context.Background(), binary, args...)
+	cmd.Dir = tmp
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader(prompt)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.New("Claude interactive run closed before resume")
+	}
+	r.cmd = cmd
+	r.stderr.Reset()
+	r.outputDone = make(chan struct{})
+	outputDone := r.outputDone
+	ch := make(chan Event, 64)
+	r.segment = ch
+	r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Reset(30 * time.Minute)
+	}
+	if err := r.launch(); err != nil {
+		r.mu.Lock()
+		r.segment = nil
+		r.mu.Unlock()
+		close(ch)
+		return nil, err
+	}
+	go func() {
+		_, _ = io.Copy(&lockedWriter{run: r}, io.LimitReader(stderr, 1<<20))
+	}()
+	go func() {
+		r.readOutput(stdout)
+		close(outputDone)
+	}()
+	return ch, nil
+}
+
 // retire lets go of the runs left waiting at an earlier point of this
 // conversation, which a new run now carries on: its turns since went to
 // another model (switched to and back), so none of them comes back to
@@ -452,7 +633,7 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	case stop == "tool":
 		r.park()
 		return // it waits on its tool calls
-	case r.stdin == nil:
+	case r.stdin == nil && !r.interactive:
 		return // it ends by itself
 	case stop != "stop":
 		r.abort()
@@ -669,6 +850,29 @@ func claudeCLIArgs(model, mcpConfig, effort string, web bool) []string {
 	return args
 }
 
+// claudeInteractiveCLIArgs are arguments for a wrapper such as
+// desplega-ai/claude-bridge. Its own -p flag asks the wrapper for a
+// machine-readable compatibility stream; the wrapper must not forward -p or
+// other headless flags to the real Claude Code process it runs inside a PTY.
+func claudeInteractiveCLIArgs(model, mcpConfig, effort string, web bool, resume string) []string {
+	own := ""
+	if web {
+		own = "WebSearch"
+	}
+	args := []string{
+		"-p", "--output-format", "stream-json",
+		"--model", model,
+		"--tools", own, "--strict-mcp-config", "--mcp-config", mcpConfig,
+	}
+	if effort != "" {
+		args = append(args, "--effort", effort)
+	}
+	if resume != "" {
+		args = append(args, "--resume", resume)
+	}
+	return args
+}
+
 // inClaudeDir is env for a Claude Code run on a saved account in use beside
 // the one it is signed in to: in the account's config directory
 // (provider's claude_dirs.go), where Claude Code keeps the sign-in fresh
@@ -768,10 +972,13 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	}
 	for s.Scan() {
 		var envelope struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-			IsError bool   `json:"is_error"`
-			Result  string `json:"result"`
+			Type       string `json:"type"`
+			Subtype    string `json:"subtype"`
+			IsError    bool   `json:"is_error"`
+			Result     string `json:"result"`
+			SessionID  string `json:"session_id"`
+			UUID       string `json:"uuid"`
+			StopReason string `json:"stop_reason"`
 			// Anthropic's id for the request, on the messages it answered,
 			// and on a failure the HTTP status Claude Code got and its
 			// name for the kind of error (rate_limit, server_error…)
@@ -783,7 +990,21 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			ToolUseResult json.RawMessage `json:"tool_use_result"`
 			// what the account has left, as Anthropic told Claude Code
 			RateLimitInfo json.RawMessage `json:"rate_limit_info"`
-			Event         struct {
+			Message       struct {
+				ID         string   `json:"id"`
+				Model      string   `json:"model"`
+				StopReason string   `json:"stop_reason"`
+				Usage      cliUsage `json:"usage"`
+				Content    []struct {
+					Type     string          `json:"type"`
+					ID       string          `json:"id"`
+					Name     string          `json:"name"`
+					Text     string          `json:"text"`
+					Thinking string          `json:"thinking"`
+					Input    json.RawMessage `json:"input"`
+				} `json:"content"`
+			} `json:"message"`
+			Event struct {
 				Type    string `json:"type"`
 				Index   int    `json:"index"`
 				Message struct {
@@ -821,11 +1042,29 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			continue
 		}
 		if envelope.Type == "result" {
+			if r.interactive && envelope.SessionID != "" {
+				r.mu.Lock()
+				r.sessionID = envelope.SessionID
+				r.mu.Unlock()
+			}
 			// a turn that failed — out of quota, rate limited — ends with
 			// this and no message_stop, the CLI waiting on its next input:
 			// the reply ends here, or it would wait with it (#177)
 			if envelope.IsError {
-				r.emit(Event{Kind: KError, Text: envelope.Result, Status: envelope.APIErrorStatus, Code: errKind, RequestID: reqID})
+				text := envelope.Result
+				if text == "" && r.interactive {
+					var bridgeErr string
+					_ = json.Unmarshal(envelope.ErrorKind, &bridgeErr)
+					text = bridgeErr
+				}
+				r.emit(Event{Kind: KError, Text: text, Status: envelope.APIErrorStatus, Code: errKind, RequestID: reqID})
+				r.endSegment()
+			} else if r.interactive {
+				// The interactive bridge emits the final assistant message before
+				// this terminal result. Closing here keeps the logical turn alive
+				// for tool calls, while avoiding a race with bridge shutdown on a
+				// completed answer.
+				r.emit(Event{Kind: KStop, Stop: stopFromAnthropic(envelope.StopReason)})
 				r.endSegment()
 			}
 			continue
@@ -839,6 +1078,89 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			var kind string
 			_ = json.Unmarshal(envelope.ErrorKind, &kind)
 			errKind = kind
+			if r.interactive {
+				// claude-bridge tails Claude's persisted interactive transcript.
+				// A resumed wrapper replays old rows before it reaches the new
+				// append, so dedupe transcript rows by their stable UUID. One
+				// Anthropic message can legitimately span several rows (thinking,
+				// text and/or tool_use), all sharing the same message id but each
+				// carrying a different row UUID.
+				rowKey := envelope.UUID
+				if rowKey == "" {
+					sum := sha256.Sum256(s.Bytes())
+					rowKey = hex.EncodeToString(sum[:])
+				}
+				r.mu.Lock()
+				if r.seenRows == nil {
+					r.seenRows = map[string]bool{}
+				}
+				seenRow := r.seenRows[rowKey]
+				if !seenRow {
+					r.seenRows[rowKey] = true
+				}
+				r.mu.Unlock()
+				if seenRow {
+					continue
+				}
+				if envelope.SessionID != "" {
+					r.mu.Lock()
+					r.sessionID = envelope.SessionID
+					r.mu.Unlock()
+				}
+				m := envelope.Message
+				firstRow := true
+				if m.ID != "" {
+					r.mu.Lock()
+					if r.seenAssistant == nil {
+						r.seenAssistant = map[string]bool{}
+					}
+					firstRow = !r.seenAssistant[m.ID]
+					if firstRow {
+						r.seenAssistant[m.ID] = true
+					}
+					r.mu.Unlock()
+				}
+				if firstRow {
+					r.mu.Lock()
+					r.asked = nil
+					r.mu.Unlock()
+					r.emit(Event{Kind: KStart, MsgID: m.ID, Model: m.Model, Usage: m.Usage.gateway(), RequestID: reqID})
+				}
+				theirs := false
+				for _, block := range m.Content {
+					switch block.Type {
+					case "text":
+						if block.Text != "" {
+							r.emit(Event{Kind: KText, Text: block.Text})
+						}
+					case "thinking":
+						if block.Thinking != "" {
+							r.emit(Event{Kind: KThink, Text: block.Thinking})
+						}
+					case "tool_use":
+						name, ok := strings.CutPrefix(block.Name, "mcp__magpie__")
+						r.mu.Lock()
+						search := r.search != nil && name == r.searchName
+						r.mu.Unlock()
+						if !ok || search {
+							continue
+						}
+						theirs = true
+						r.mu.Lock()
+						r.asked = append(r.asked, name)
+						r.mu.Unlock()
+						r.emit(Event{Kind: KToolStart, ID: block.ID, Name: name})
+						if len(block.Input) > 0 {
+							r.emit(Event{Kind: KToolArgs, Text: string(block.Input)})
+						}
+					}
+				}
+				if theirs {
+					r.emit(Event{Kind: KStop, Stop: "tool"})
+					r.endSegment()
+				}
+				continue
+			}
 			continue
 		}
 		var searched struct {
@@ -1012,6 +1334,34 @@ func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 		text.WriteString("\n\n")
 	}
 	return closeBlocks(blocks, &text), nil
+}
+
+// renderClaudeBridgePrompt flattens the prompt blocks into the text accepted
+// by the experimental interactive bridge. Image/file transport is deliberately
+// not guessed here: callers get an explicit error until the PTY backend has a
+// tested attachment path.
+func renderClaudeBridgePrompt(req *Request) (string, error) {
+	blocks, err := renderClaudePrompt(req)
+	if err != nil {
+		return "", err
+	}
+	return flattenClaudeBridgeBlocks(blocks)
+}
+
+func renderClaudeBridgeTurn(msgs []Message) (string, error) {
+	return flattenClaudeBridgeBlocks(renderClaudeTurn(msgs))
+}
+
+func flattenClaudeBridgeBlocks(blocks []map[string]any) (string, error) {
+	var out strings.Builder
+	for _, block := range blocks {
+		if block["type"] != "text" {
+			return "", errors.New("Claude interactive bridge does not yet support image prompt blocks")
+		}
+		text, _ := block["text"].(string)
+		out.WriteString(text)
+	}
+	return out.String(), nil
 }
 
 // renderClaudeTurn is the user's messages in a conversation Claude Code
@@ -1384,12 +1734,40 @@ func (r *subscriptionRun) launch() error {
 	if err != nil {
 		return err
 	}
+	var turnDone, outputDone chan struct{}
 	r.mu.Lock()
 	r.tree = t
+	if r.interactive {
+		turnDone = make(chan struct{})
+		r.turnDone = turnDone
+		outputDone = r.outputDone
+	}
 	r.mu.Unlock()
 	go func() {
 		_ = t.Wait()
-		r.finish()
+		if !r.interactive {
+			r.finish()
+			return
+		}
+		// Wait until every compatibility event already written by the bridge
+		// has been parsed before deciding whether this was a normal one-turn
+		// exit or an unexpected death in the middle of a reply/tool call.
+		if outputDone != nil {
+			<-outputDone
+		}
+		r.mu.Lock()
+		if r.tree == t {
+			r.tree = nil
+			r.cmd = nil
+		}
+		active := r.segment != nil
+		pending := len(r.pending) > 0
+		closed := r.closed
+		r.mu.Unlock()
+		close(turnDone)
+		if !closed && (active || pending) {
+			r.finish()
+		}
 	}()
 	return nil
 }
@@ -1397,8 +1775,26 @@ func (r *subscriptionRun) launch() error {
 func (r *subscriptionRun) abort() {
 	r.mu.Lock()
 	t := r.tree
+	cmd := r.cmd
+	interactive := r.interactive
+	done := r.turnDone
 	r.mu.Unlock()
 	if t != nil {
+		// An interactive bridge owns a detached PTY/tmux session. A hard
+		// process-group kill can stop the wrapper before its SIGINT handler
+		// tears that session down, leaving the real Claude TUI orphaned. Give
+		// the wrapper a short graceful-shutdown window first; bridges that do
+		// not handle Interrupt fall through to the existing hard tree kill.
+		if interactive && cmd != nil && cmd.Process != nil {
+			if err := cmd.Process.Signal(os.Interrupt); err == nil && done != nil {
+				select {
+				case <-done:
+					r.finish()
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		}
 		t.Kill()
 	}
 	r.finish()
