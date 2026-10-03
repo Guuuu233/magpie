@@ -617,6 +617,77 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s",
 	}
 }
 
+func TestClaudeDesktopTurnCompanionResumesDirtyInteractiveSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+echo '{"type":"assistant","session_id":"sess-main","uuid":"row-recovered","message":{"id":"m-recovered","model":"claude-opus-5-5","content":[{"type":"text","text":"RECOVERED"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-main","stop_reason":"end_turn","result":"RECOVERED"}'
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	owner := "claude\x00u\x00" + ownHome
+	outer := "desktop-session-turn-companion"
+	baseReq := &Request{Model: "claude-opus-5-5", Tools: []Tool{{Name: "read", Schema: json.RawMessage(`{"type":"object"}`)}}}
+	b := newSubscriptionBridge()
+	b.saveInteractiveSession(owner, outer, interactiveSessionEntry{
+		SessionID:  "sess-main",
+		ConvKey:    "stale-conversation-checkpoint",
+		ReplyKey:   "stale-reply-checkpoint",
+		ContextKey: turnKey(owner, baseReq, nil),
+		Dirty:      true,
+	})
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	companion := "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+	body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[` +
+		`{"role":"user","content":"old outer history"},` +
+		`{"role":"assistant","content":"rewritten outer reply"},` +
+		`{"role":"user","content":` + strconv.Quote(companion) + `}]}`
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	req.Header.Set(SessionHeader, outer)
+	rec := httptest.NewRecorder()
+	var u Usage
+	if code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+		t.Fatalf("%d %s: %s", code, why, rec.Body.String())
+	}
+	var res struct {
+		Content []struct{ Text string } `json:"content"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 || res.Content[0].Text != "RECOVERED" {
+		t.Fatalf("answer: %s (%v)", rec.Body, err)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logBytes)
+	if !strings.Contains(log, "--resume sess-main") || !strings.Contains(log, companion) {
+		t.Fatalf("turn companion did not resume the dirty inner session:\n%s", log)
+	}
+	if strings.Contains(log, "old outer history") || strings.Contains(log, "rewritten outer reply") {
+		t.Fatalf("turn companion replayed outer history:\n%s", log)
+	}
+	after, ok := s.subscription.interactiveSession(owner, outer)
+	wantReply := assistantReplyKey(Message{Role: "assistant", Parts: []Part{{Kind: Text, Text: "RECOVERED"}}})
+	if !ok || after.Dirty || after.SessionID != "sess-main" || after.ReplyKey != wantReply {
+		t.Fatalf("turn companion did not leave a clean recovered checkpoint: %#v, %v", after, ok)
+	}
+}
+
 func TestClaudeInteractiveSessionRestoresAfterEarlierHistoryRewrite(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")

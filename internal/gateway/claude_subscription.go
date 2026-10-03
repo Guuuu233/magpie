@@ -384,6 +384,8 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 				log.Printf("Claude interactive persisted resume: reason=%s session=%s", restore, key)
 			case interactiveRestoreReplyAnchor:
 				log.Printf("Claude interactive persisted resume recovered: reason=%s session=%s", restore, key)
+			case interactiveRestoreCompanion:
+				log.Printf("Claude interactive persisted resume recovered: reason=%s session=%s", restore, key)
 			case interactiveRestoreExact:
 				if contextChanged {
 					log.Printf("Claude interactive persisted resume recovered: reason=context_changed session=%s", key)
@@ -393,7 +395,7 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 			}
 		}
 		switch restore {
-		case interactiveRestoreExact, interactiveRestoreReplyAnchor:
+		case interactiveRestoreExact, interactiveRestoreReplyAnchor, interactiveRestoreCompanion:
 			bridgePrompt, bridgeImages, err = renderClaudeBridgeTurnWithImages(since)
 			if err == nil && contextChanged {
 				bridgePrompt = renderClaudeInteractiveContextRefresh(req) + bridgePrompt
@@ -2157,6 +2159,22 @@ func claudeDesktopSuggestion(req *Request) bool {
 		return false
 	}
 	return false
+}
+
+func claudeDesktopTurnCompanionSuffix(req *Request) []Message {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		m := req.Messages[i]
+		if m.Role != "user" {
+			continue
+		}
+		for _, p := range m.Parts {
+			if p.Kind == Text && strings.HasPrefix(strings.TrimSpace(p.Text), "[Your previous response had no visible output.") {
+				return []Message{m}
+			}
+		}
+		return nil
+	}
+	return nil
 }
 
 func claudeDesktopSuggestionRequest(req *Request) *Request {

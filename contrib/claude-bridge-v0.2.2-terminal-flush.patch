@@ -1,0 +1,38 @@
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -884,19 +884,22 @@
+   }
+   // Even an empty/odd turn gets init before the terminal result, like claude -p.
+   ensureClaudeInit();
+-  process.stdout.write(
+-    JSON.stringify(
+-      makeClaudeResultEvent({
+-        resultText,
+-        sessionId: transcriptSessionId,
+-        durationMs: lastTurnDurationMs,
+-        model: currentModel(),
+-        usage: lastAssistantUsage(),
+-        stopReason: lastAssistantRow ? stopReasonFromAssistantRow(lastAssistantRow) : undefined,
+-        structuredOutput: structured ? { present: true, value: structured.value } : undefined,
+-        uuid: randomUUID(),
+-      })
+-    ) + "\n"
++  await new Promise<void>((resolve) =>
++    process.stdout.write(
++      JSON.stringify(
++        makeClaudeResultEvent({
++          resultText,
++          sessionId: transcriptSessionId,
++          durationMs: lastTurnDurationMs,
++          model: currentModel(),
++          usage: lastAssistantUsage(),
++          stopReason: lastAssistantRow ? stopReasonFromAssistantRow(lastAssistantRow) : undefined,
++          structuredOutput: structured ? { present: true, value: structured.value } : undefined,
++          uuid: randomUUID(),
++        })
++      ) + "\n",
++      () => resolve()
++    )
+   );
+   // stream-json compatibility has already emitted its terminal result. Tear
+   // down the one-shot PTY here instead of relying on the caller to signal us;

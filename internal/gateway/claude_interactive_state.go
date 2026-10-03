@@ -20,6 +20,7 @@ type interactiveRestoreStatus string
 const (
 	interactiveRestoreExact              interactiveRestoreStatus = "exact"
 	interactiveRestoreReplyAnchor        interactiveRestoreStatus = "reply_anchor"
+	interactiveRestoreCompanion          interactiveRestoreStatus = "turn_companion"
 	interactiveRestoreStateMissing       interactiveRestoreStatus = "state_missing"
 	interactiveRestoreDirty              interactiveRestoreStatus = "dirty"
 	interactiveRestoreContextMismatch    interactiveRestoreStatus = "context_mismatch"
@@ -208,6 +209,9 @@ func (b *subscriptionBridge) restoreInteractiveSession(owner, outerSession strin
 	saved, ok := b.interactiveSession(owner, outerSession)
 	if !ok {
 		return interactiveSessionEntry{}, nil, interactiveRestoreStateMissing
+	}
+	if suffix := claudeDesktopTurnCompanionSuffix(req); suffix != nil {
+		return saved, suffix, interactiveRestoreCompanion
 	}
 	if saved.Dirty {
 		return saved, nil, interactiveRestoreDirty
