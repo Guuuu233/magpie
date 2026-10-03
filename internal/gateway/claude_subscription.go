@@ -940,6 +940,11 @@ func cleanClaudeEnv(env []string) []string {
 
 type lockedWriter struct{ run *subscriptionRun }
 
+// interactiveAliveEvery is how often a quiet PTY-backed Claude turn proves
+// to the HTTP relay that its bridge process is still alive. The event is
+// internal-only; relay translates it into the client's native keepalive.
+var interactiveAliveEvery = 15 * time.Second
+
 func (w *lockedWriter) Write(p []byte) (int, error) {
 	w.run.mu.Lock()
 	defer w.run.mu.Unlock()
@@ -968,6 +973,19 @@ func (r *subscriptionRun) emit(ev Event) {
 	defer r.mu.Unlock()
 	if r.segment != nil {
 		r.segment <- ev
+	}
+}
+
+func (r *subscriptionRun) keepInteractiveAlive(done <-chan struct{}) {
+	t := time.NewTicker(interactiveAliveEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			r.emit(Event{Kind: KAlive})
+		}
 	}
 }
 
@@ -1870,6 +1888,9 @@ func (r *subscriptionRun) launch() error {
 		outputDone = r.outputDone
 	}
 	r.mu.Unlock()
+	if r.interactive {
+		go r.keepInteractiveAlive(turnDone)
+	}
 	go func() {
 		_ = t.Wait()
 		if !r.interactive {
@@ -2088,16 +2109,21 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 	abort func(), ended func(said, stop string, ok bool)) (int, string) {
 	stream := req.Stream
 	if stream {
+		var aliveFirst bool
 		// an error before any of the answer — out of quota, rate limited —
 		// is a status, not a stream, so another account can take over
 		var head []Event
 		for ev := range events {
+			if ev.Kind == KAlive {
+				aliveFirst = true
+				break
+			}
 			head = append(head, ev)
 			if ev.Kind != KStart && ev.Kind != KUsage {
 				break
 			}
 		}
-		if n := len(head); n == 0 || head[n-1].Kind == KError {
+		if n := len(head); !aliveFirst && (n == 0 || head[n-1].Kind == KError) {
 			msg := name + " ended without an answer"
 			if n > 0 {
 				msg = head[n-1].Text
@@ -2129,11 +2155,19 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 				said += ev.Text
 			case KStop:
 				stop = ev.Stop
+			case KAlive:
+				if sw.quiet() >= keepaliveGap {
+					enc.keepalive()
+				}
+				return
 			}
 			enc.event(ev)
 		}
 		for _, ev := range head {
 			see(ev)
+		}
+		if aliveFirst {
+			enc.keepalive()
 		}
 		// a client waiting on a reply that goes on is kept from its idle
 		// timeout while none of it comes (#436)

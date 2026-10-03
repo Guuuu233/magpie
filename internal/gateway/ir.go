@@ -165,6 +165,7 @@ const (
 	KError                      // Text
 	KSearch                     // Text (the query), Hits: a web search run for the model
 	KImage                      // Name (media type), Text (base64): an image the model made
+	KAlive                      // internal liveness only; never user-visible
 )
 
 // Event is one thing a streaming reply said.
