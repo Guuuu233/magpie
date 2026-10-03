@@ -113,6 +113,7 @@ type subscriptionRun struct {
 	// drives the real Claude Code TUI inside a PTY. sessionID is the Claude
 	// session the bridge reports, used to resume the next turn.
 	interactive   bool
+	ephemeral     bool
 	sessionID     string
 	outerSession  string
 	binary        string
@@ -324,6 +325,15 @@ func callbackBaseURL() string {
 }
 
 func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, configDir, owner, outerSession string) (*subscriptionRun, <-chan Event, error) {
+	return b.startWithMode(ctx, req, model, configDir, owner, outerSession, false)
+}
+
+func (b *subscriptionBridge) startSuggestion(ctx context.Context, req *Request, model, configDir, owner, outerSession string) (*subscriptionRun, <-chan Event, error) {
+	side := claudeDesktopSuggestionRequest(req)
+	return b.startWithMode(ctx, side, model, configDir, owner, "", true)
+}
+
+func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, model, configDir, owner, outerSession string, suggestionFork bool) (*subscriptionRun, <-chan Event, error) {
 	binary, interactive, err := claudeSubscriptionBinary()
 	if err != nil {
 		return nil, nil, err
@@ -392,8 +402,13 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		case interactiveRestoreStateMissing:
 			bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
 		default:
-			cleanup()
-			return nil, nil, fmt.Errorf("Claude interactive persisted resume failed: %s; refusing full history replay", restore)
+			if suggestionFork {
+				resumeID = ""
+				bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
+			} else {
+				cleanup()
+				return nil, nil, fmt.Errorf("Claude interactive persisted resume failed: %s; refusing full history replay", restore)
+			}
 		}
 		if err != nil {
 			cleanup()
@@ -418,6 +433,9 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	var args []string
 	if interactive {
 		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, resumeID)
+		if suggestionFork && resumeID != "" {
+			args = append(args, "--fork-session")
+		}
 	} else {
 		args = claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
 	}
@@ -454,11 +472,23 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		return nil, nil, err
 	}
 
+	persistOuterSession := outerSession
+	if suggestionFork {
+		persistOuterSession = ""
+	}
 	run := &subscriptionRun{
 		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp, work: work,
-		interactive: interactive, schema: len(req.Schema) > 0, sessionID: resumeID, outerSession: outerSession, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
-		images:  bridgeImages,
-		pending: map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
+		interactive:  interactive,
+		ephemeral:    suggestionFork,
+		schema:       len(req.Schema) > 0,
+		sessionID:    resumeID,
+		outerSession: persistOuterSession,
+		binary:       binary,
+		mcpConfig:    string(mcpConfig),
+		toolsPath:    toolsPath,
+		env:          slices.Clone(env),
+		images:       bridgeImages,
+		pending:      map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
 	}
 	if interactive {
 		run.outputDone = make(chan struct{})
@@ -470,8 +500,8 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	b.mu.Lock()
 	b.runs[token] = run
 	b.mu.Unlock()
-	if interactive && resumeID != "" {
-		b.markInteractiveSessionDirty(owner, outerSession)
+	if interactive && resumeID != "" && persistOuterSession != "" {
+		b.markInteractiveSessionDirty(owner, persistOuterSession)
 	}
 
 	if err := run.launch(); err != nil {
@@ -717,6 +747,9 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	switch {
 	case !ok:
 		// the caller has no whole reply, so no tool calls to answer
+		r.abort()
+		return
+	case r.ephemeral:
 		r.abort()
 		return
 	case stop == "tool":
@@ -2085,10 +2118,13 @@ func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request,
 			// the spent one in its Claude Code)
 			owner += "\x00" + ownHome
 		}
-		if run, events := s.subscription.resume(req, owner); run != nil {
-			return run, events, nil
+		suggestion := claudeDesktopSuggestion(req)
+		if !suggestion {
+			if run, events := s.subscription.resume(req, owner); run != nil {
+				return run, events, nil
+			}
+			s.subscription.retire(owner, req.Messages)
 		}
-		s.subscription.retire(owner, req.Messages)
 		if req.Effort == "" && autoModeClassifier(req) {
 			// Claude Code's auto mode classifier asks a verdict of a few
 			// words within a minute; a Claude Code run at its default
@@ -2099,9 +2135,71 @@ func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request,
 		if err != nil {
 			return nil, nil, err
 		}
+		if suggestion {
+			return s.subscription.startSuggestion(ctx, req, model, dir, owner, outerSession)
+		}
 		return s.subscription.start(ctx, req, model, dir, owner, outerSession)
 	}
 	return s.serveSubscription(w, r, from, "Claude Code", model, body, usage, start)
+}
+
+func claudeDesktopSuggestion(req *Request) bool {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		m := req.Messages[i]
+		if m.Role != "user" {
+			continue
+		}
+		for _, p := range m.Parts {
+			if p.Kind == Text && strings.HasPrefix(strings.TrimSpace(p.Text), "[SUGGESTION MODE:") {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func claudeDesktopSuggestionRequest(req *Request) *Request {
+	out := *req
+	out.System = ""
+	out.Tools = nil
+	out.ToolChoice = ""
+	out.WebSearch = false
+	out.Schema = nil
+	out.Effort = "low"
+	out.Thinking = false
+	out.ThinkOff = true
+	out.Messages = nil
+
+	selected := make([]Message, 0, 3)
+	for i := len(req.Messages) - 1; i >= 0 && len(selected) < 3; i-- {
+		m := req.Messages[i]
+		var text strings.Builder
+		for _, p := range m.Parts {
+			if p.Kind == Text && strings.TrimSpace(p.Text) != "" {
+				if text.Len() > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString(p.Text)
+			}
+		}
+		if text.Len() == 0 {
+			continue
+		}
+		runes := []rune(strings.TrimSpace(text.String()))
+		if len(runes) > 6000 {
+			runes = runes[len(runes)-6000:]
+		}
+		selected = append(selected, Message{
+			Role:  m.Role,
+			Parts: []Part{{Kind: Text, Text: string(runes)}},
+		})
+	}
+	for i, j := 0, len(selected)-1; i < j; i, j = i+1, j-1 {
+		selected[i], selected[j] = selected[j], selected[i]
+	}
+	out.Messages = selected
+	return &out
 }
 
 // serveSubscription answers a request through an agent's own binary: a new

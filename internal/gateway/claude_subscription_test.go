@@ -518,6 +518,105 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"sess
 	}
 }
 
+func TestClaudeDesktopSuggestionDoesNotAdvanceInteractiveConversation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case "$prompt" in
+  *"[SUGGESTION MODE:"*) sid=sess-suggest; text=SUGGEST ;;
+  *)
+    sid=sess-main
+    case " $* " in
+      *" --resume sess-main "*) text=MAIN2 ;;
+      *) text=MAIN1 ;;
+    esac
+    ;;
+esac
+printf '{"type":"assistant","session_id":"%s","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$sid" "$text" "$text" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","stop_reason":"end_turn","result":"%s"}\n' "$sid" "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+	ask := func(s *Server, tools, msgs string) (int, string) {
+		t.Helper()
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":` + tools + `,"messages":` + msgs + `}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, "desktop-session-suggestion")
+		rec := httptest.NewRecorder()
+		var u Usage
+		code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u)
+		if code != 200 {
+			return code, why + "\n" + rec.Body.String()
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			t.Fatalf("answer: %s (%v)", rec.Body, err)
+		}
+		return code, res.Content[0].Text
+	}
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	tools := `[{"name":"read","input_schema":{"type":"object"}}]`
+	code, first := ask(s, tools, `[`+msg("user", "hello")+`]`)
+	if code != 200 || first != "MAIN1" {
+		t.Fatalf("main first = %d %q", code, first)
+	}
+
+	owner := "claude\x00u\x00" + ownHome
+	before, ok := s.subscription.interactiveSession(owner, "desktop-session-suggestion")
+	if !ok || before.SessionID != "sess-main" {
+		t.Fatalf("main persisted state missing before suggestion: %#v, %v", before, ok)
+	}
+	suggestionPrompt := "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\nReturn one short suggestion."
+	code, suggestion := ask(s, `[]`, `[`+msg("user", "hello")+`,`+msg("assistant", first)+`,`+msg("user", suggestionPrompt)+`]`)
+	if code != 200 || suggestion != "SUGGEST" {
+		t.Fatalf("suggestion = %d %q", code, suggestion)
+	}
+
+	after, ok := s.subscription.interactiveSession(owner, "desktop-session-suggestion")
+	if !ok || after.SessionID != before.SessionID || after.ConvKey != before.ConvKey || after.ReplyKey != before.ReplyKey {
+		t.Fatalf("suggestion advanced main persisted checkpoint:\nbefore=%#v\nafter=%#v", before, after)
+	}
+
+	code, second := ask(s, tools, `[`+msg("user", "hello")+`,`+msg("assistant", first)+`,`+msg("user", "real next turn")+`]`)
+	if code != 200 || second != "MAIN2" {
+		t.Fatalf("real turn after suggestion = %d %q", code, second)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(b)
+	var suggestionIsolated, realResumed bool
+	for _, block := range strings.Split(log, "args:") {
+		switch {
+		case strings.Contains(block, "SUGGESTION MODE:"):
+			suggestionIsolated = !strings.Contains(block, "--resume sess-main") && !strings.Contains(block, "--fork-session") && strings.Contains(block, "--effort low")
+		case strings.Contains(block, "real next turn"):
+			realResumed = strings.Contains(block, "--resume sess-main") && !strings.Contains(block, "--fork-session")
+		}
+	}
+	if !suggestionIsolated || !realResumed {
+		t.Fatalf("suggestion must use an isolated low-effort run while the real turn resumes the main session:\n%s", log)
+	}
+}
+
 func TestClaudeInteractiveSessionRestoresAfterEarlierHistoryRewrite(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")
