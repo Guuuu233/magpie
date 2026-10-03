@@ -32,6 +32,9 @@ existing transcript. Upstream 0.2.2 can miss that transcript and wait for a
 fresh one, which can deadlock resumed MCP tool calls. It also installs
 SIGINT/SIGTERM cleanup handlers in print mode; without those handlers Magpie
 can terminate the wrapper while leaving its detached tmux/Claude TUI alive.
+Finally, it retries prompt submission when Claude Code leaves pasted text in
+the bottom input editor after the first synthetic Enter; this was observed on
+large/multiline prompts in Claude Code 2.1.287.
 
 The patch is generated with zero lines of unified context so the patch file
 itself does not contain whitespace-only diff context lines. Apply it with:
@@ -72,6 +75,8 @@ Verified:
 - multi-turn resume;
 - external MCP tool calls and tool results;
 - resumed-session MCP tool calls;
+- inline base64 image prompts, delivered through a private Magpie MCP image
+  tool without enabling Claude Code's unrestricted built-in `Read` tool;
 - transcript rows where thinking and visible text share one message id;
 - cleanup of detached tmux/Claude children after one-off requests.
 
@@ -80,7 +85,9 @@ Deliberately conservative behavior:
 - an effort-level change between turns abandons the interactive run and falls
   back to a fresh conversation path rather than trying to send the headless
   control protocol to the interactive TUI;
-- image-specific behavior has not yet been treated as a supported target.
+- image URLs are still rejected explicitly; the interactive image path currently
+  supports inline base64 images, which covers screenshots and pasted images from
+  the tested clients.
 
 ## Rollback
 

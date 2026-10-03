@@ -11,6 +11,222 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
+func TestInteractiveSubscriptionPromptImagesUsePrivateMCPTool(t *testing.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	req := &Request{Messages: []Message{{Role: "user", Parts: []Part{
+		{Kind: Text, Text: "what is this?"},
+		{Kind: Image, MediaType: "image/png", Data: png},
+	}}}}
+	prompt, images, err := renderClaudeBridgePromptWithImages(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("images: %#v", images)
+	}
+	var id string
+	var image Part
+	for id, image = range images {
+	}
+	if image.Data != png || image.MediaType != "image/png" {
+		t.Fatalf("image: %#v", image)
+	}
+	if !strings.Contains(prompt, "what is this?") || !strings.Contains(prompt, interactiveImageTool) || !strings.Contains(prompt, id) {
+		t.Fatalf("prompt did not point Claude at the private image tool: %q", prompt)
+	}
+
+	tools := claudeInteractiveTools(req, len(images) > 0)
+	if len(tools) != 1 || tools[0].Name != interactiveImageTool {
+		t.Fatalf("private image tool missing: %#v", tools)
+	}
+}
+
+func TestInteractiveSubscriptionPrivateImageToolReturnsMCPImage(t *testing.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	b := newSubscriptionBridge()
+	im := Part{Kind: Image, MediaType: "image/png", Data: png}
+	id := interactiveImageID(im)
+	run := &subscriptionRun{bridge: b, token: "tok", interactive: true, pending: map[string]chan mcpToolResult{}, images: map[string]Part{id: im}}
+	b.runs["tok"] = run
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cb/{token}", b.mcpCall)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	res, err := http.Post(srv.URL+"/cb/tok", "application/json", strings.NewReader(`{"tool_call_id":"img_1","name":"`+interactiveImageTool+`","arguments":{"id":"`+id+`"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d", res.StatusCode)
+	}
+	var got mcpToolResult
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Content) < 2 || got.Content[1]["type"] != "image" || got.Content[1]["data"] != png || got.Content[1]["mimeType"] != "image/png" {
+		b, _ := json.Marshal(got)
+		t.Fatalf("image result: %s", b)
+	}
+}
+
+func TestInteractiveSubscriptionPrivateImageToolIsHiddenFromCaller(t *testing.T) {
+	run := &subscriptionRun{interactive: true}
+	seg := run.attach()
+	lines := []string{
+		`{"type":"assistant","uuid":"img-row","session_id":"sess-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_img","name":"mcp__magpie__` + interactiveImageTool + `","input":{"id":"img_1"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":2}}}`,
+		`{"type":"assistant","uuid":"text-row","session_id":"sess-1","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"text","text":"seen"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1","stop_reason":"end_turn","result":"seen"}`,
+	}
+	go run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	var got []string
+	for ev := range seg {
+		switch ev.Kind {
+		case KToolStart:
+			got = append(got, "tool:"+ev.Name)
+		case KText:
+			got = append(got, "text:"+ev.Text)
+		}
+	}
+	if s := strings.Join(got, "|"); s != "text:seen" {
+		t.Fatalf("private image tool leaked to caller: %s", s)
+	}
+}
+
+func TestHeadlessSubscriptionDoesNotReserveInteractiveImageToolName(t *testing.T) {
+	run := &subscriptionRun{}
+	seg := run.attach()
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1}}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__magpie__` + interactiveImageTool + `"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}}`,
+		`{"type":"stream_event","event":{"type":"message_stop"}}`,
+	}
+	go run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	var got []string
+	for ev := range seg {
+		switch ev.Kind {
+		case KToolStart:
+			got = append(got, "tool:"+ev.Name)
+		case KToolArgs:
+			got = append(got, "args:"+ev.Text)
+		case KStop:
+			got = append(got, "stop:"+ev.Stop)
+		}
+	}
+	if s := strings.Join(got, "|"); s != "tool:"+interactiveImageTool+"|args:{}|stop:tool" {
+		t.Fatalf("headless caller tool was treated as private: %s", s)
+	}
+}
+
+func TestClaudeInteractivePromptRegistersInlineImageAsInternalMCPAttachment(t *testing.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	req := &Request{Messages: []Message{{Role: "user", Parts: []Part{
+		{Kind: Text, Text: "what is in this image?"},
+		{Kind: Image, MediaType: "image/png", Data: png},
+	}}}}
+
+	prompt, images, err := renderClaudeBridgePromptWithImages(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("images = %d, want 1", len(images))
+	}
+	var id string
+	for k, im := range images {
+		id = k
+		if im.Data != png || im.MediaType != "image/png" {
+			t.Fatalf("registered image = %+v", im)
+		}
+	}
+	if id == "" || !strings.Contains(prompt, id) || !strings.Contains(prompt, interactiveImageTool) {
+		t.Fatalf("prompt does not tell Claude how to view attachment: %q", prompt)
+	}
+	tools := claudeInteractiveTools(req, len(images) > 0)
+	found := false
+	for _, tool := range tools {
+		if tool.Name == interactiveImageTool {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("interactive image tool missing from %+v", tools)
+	}
+}
+
+func TestClaudeInteractiveImageToolReturnsImageInsideMCP(t *testing.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	b := newSubscriptionBridge()
+	run := &subscriptionRun{
+		bridge: b, token: "tok", interactive: true,
+		pending: map[string]chan mcpToolResult{},
+		images:  map[string]Part{"img_test": {Kind: Image, MediaType: "image/png", Data: png}},
+	}
+	b.runs["tok"] = run
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cb/{token}", b.mcpCall)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	res, err := http.Post(srv.URL+"/cb/tok", "application/json", strings.NewReader(`{"tool_call_id":"toolu_internal","name":"`+interactiveImageTool+`","arguments":{"id":"img_test"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var got mcpToolResult
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 200 || got.IsError {
+		t.Fatalf("status=%d result=%+v", res.StatusCode, got)
+	}
+	var image map[string]any
+	for _, part := range got.Content {
+		if part["type"] == "image" {
+			image = part
+		}
+	}
+	if image == nil || image["data"] != png || image["mimeType"] != "image/png" {
+		t.Fatalf("internal image result = %+v", got.Content)
+	}
+	b.mu.Lock()
+	_, leaked := b.calls["toolu_internal"]
+	b.mu.Unlock()
+	if leaked {
+		t.Fatal("internal image tool call leaked into caller-visible pending calls")
+	}
+}
+
+func TestClaudeInteractiveParserHidesInternalImageToolCall(t *testing.T) {
+	run := &subscriptionRun{interactive: true}
+	seg := run.attach()
+	lines := []string{
+		`{"type":"assistant","uuid":"row-tool","session_id":"sess-1","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_internal","name":"mcp__magpie__` + interactiveImageTool + `","input":{"id":"img_test"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":5}}}`,
+		`{"type":"assistant","uuid":"row-text","session_id":"sess-1","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"text","text":"I can see it"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":4}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1","stop_reason":"end_turn","result":"I can see it"}`,
+	}
+	go run.readOutput(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	var tools int
+	var text string
+	var stop string
+	for ev := range seg {
+		switch ev.Kind {
+		case KToolStart:
+			tools++
+		case KText:
+			text += ev.Text
+		case KStop:
+			stop = ev.Stop
+		}
+	}
+	if tools != 0 || text != "I can see it" || stop != "stop" {
+		t.Fatalf("tools=%d text=%q stop=%q", tools, text, stop)
+	}
+}
+
 // An image a tool returned reaches the Claude Code a subscription runs as
 // MCP image content, which it hands its model as an image block: in an
 // Anthropic tool_result, and beside a Chat tool message, where a client

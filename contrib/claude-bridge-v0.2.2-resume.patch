@@ -21,7 +21,7 @@ index 55b1b6b..cfbc33d 100644
 +}
 +
 diff --git a/src/cli.ts b/src/cli.ts
-index 1673770..50d5ad9 100755
+index 1673770..0d479de 100755
 --- a/src/cli.ts
 +++ b/src/cli.ts
 @@ -23,0 +24 @@ import {
@@ -31,12 +31,42 @@ index 1673770..50d5ad9 100755
 +import { claudeResumeSessionId, formatClaudeHelp, formatWrapperHelp, parseCliArgs, type OutputFormat } from "./args.ts";
 @@ -151,0 +153 @@ const forwardedClaudeArgs = jsonSchema
 +const resumedSessionId = claudeResumeSessionId(forwardedClaudeArgs);
-@@ -1044,0 +1047 @@ async function startTranscriptTail(): Promise<void> {
+@@ -408,0 +411,16 @@ function sendPromptToTmux(text: string, id: string): boolean {
++  // Claude Code can occasionally leave a pasted prompt in the editor after
++  // the first synthetic Enter (especially large/multiline prompts). Detect
++  // only the bottom-most input prompt: a submitted/busy/completed pane has an
++  // empty bottom prompt, while an unsubmitted paste still has text after ❯.
++  sleepSync(600);
++  const pane = capturePane();
++  if (paneHasPendingInput(pane)) {
++    const retry = spawnSync(tmuxPath, ["send-keys", "-t", sessionName, "Enter"], {
++      encoding: "utf8",
++    });
++    if (retry.status !== 0) {
++      return failTmuxSend("retry prompt submission", retry);
++    }
++    desplegaDebug("retried prompt submission through tmux", { id, length: text.length });
++  }
++
+@@ -412,0 +431,6 @@ function sendPromptToTmux(text: string, id: string): boolean {
++function paneHasPendingInput(pane: string): boolean {
++  const prompts = pane.split("\n").filter(line => /^\s*(?:❯|>)\s*/.test(line));
++  if (prompts.length === 0) return false;
++  return /^\s*(?:❯|>)\s*\S/.test(prompts[prompts.length - 1]!);
++}
++
+@@ -827,0 +852,5 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
++  // stream-json compatibility has already emitted its terminal result. Tear
++  // down the one-shot PTY here instead of relying on the caller to signal us;
++  // otherwise a fast HTTP client can finish while the detached tmux/Claude
++  // session survives the wrapper turn.
++  shutdown();
+@@ -1044,0 +1074 @@ async function startTranscriptTail(): Promise<void> {
 +      (resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
-@@ -1204,2 +1206,0 @@ function startRepl(): void {
+@@ -1204,2 +1233,0 @@ function startRepl(): void {
 -  process.on("SIGINT", () => shutdown());
 -  process.on("SIGTERM", () => shutdown());
-@@ -1221,0 +1223,5 @@ desplegaDebug("run state created", { runDir });
+@@ -1221,0 +1250,5 @@ desplegaDebug("run state created", { runDir });
 +// Print mode is also a long-lived wrapper while Claude is waiting on MCP
 +// tools. Handle termination in every mode so Magpie can ask the wrapper to
 +// tear down the detached tmux/PTY before falling back to a hard process kill.

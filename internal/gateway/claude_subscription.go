@@ -120,6 +120,10 @@ type subscriptionRun struct {
 	outputDone    chan struct{}
 	seenAssistant map[string]bool
 	seenRows      map[string]bool
+	// images are inline prompt images the interactive PTY transport exposes
+	// through its private MCP image tool. They stay with the logical run so a
+	// resumed Claude session can still inspect an image from an earlier turn.
+	images map[string]Part
 
 	// the tools its agent was told of, as it started and since
 	tools map[string]bool
@@ -181,6 +185,11 @@ type subscriptionRun struct {
 
 // waitTool collects a tool result that took longer than an agent's patience.
 const waitTool = "magpie_wait"
+
+// interactiveImageTool is private to the PTY subscription transport. Claude
+// calls it to receive an inline prompt image as MCP image content, avoiding an
+// unrestricted built-in Read tool on the VPS.
+const interactiveImageTool = "magpie_view_attached_image"
 
 type mcpToolResult struct {
 	Content []map[string]any `json:"content"`
@@ -327,7 +336,19 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	}
 	cleanup := func() { _ = os.RemoveAll(tmp) }
 
-	tools := bridgeTools(req)
+	var bridgePrompt string
+	var bridgeImages map[string]Part
+	var tools []bridgeTool
+	if interactive {
+		bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		tools = claudeInteractiveTools(req, len(bridgeImages) > 0)
+	} else {
+		tools = bridgeTools(req)
+	}
 	toolsPath := filepath.Join(tmp, "tools.json")
 	toolBytes, _ := json.Marshal(tools)
 	if err := os.WriteFile(toolsPath, toolBytes, 0o600); err != nil {
@@ -341,13 +362,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callback, toolsPath}},
 	}})
 	var args []string
-	var bridgePrompt string
 	if interactive {
-		bridgePrompt, err = renderClaudeBridgePrompt(req)
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
 		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, "")
 	} else {
 		args = claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
@@ -388,6 +403,7 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	run := &subscriptionRun{
 		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp,
 		interactive: interactive, schema: len(req.Schema) > 0, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
+		images:  bridgeImages,
 		pending: map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
 	}
 	if interactive {
@@ -471,12 +487,12 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 			run.abort()
 			return nil, nil
 		}
-		prompt, err := renderClaudeBridgeTurn(since)
+		prompt, images, err := renderClaudeBridgeTurnWithImages(since)
 		if err != nil {
 			run.abort()
 			return nil, nil
 		}
-		ch, err := run.startInteractiveTurn(req, prompt)
+		ch, err := run.startInteractiveTurn(req, prompt, images)
 		if err != nil {
 			run.abort()
 			return nil, nil
@@ -528,7 +544,7 @@ func (r *subscriptionRun) setEffort(effort string) error {
 // whose real Claude session lives in the interactive PTY bridge. The wrapper
 // is intentionally one-shot; --resume reconnects the new PTY to the same
 // Claude session while Magpie keeps the logical run and MCP callback token.
-func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string) (<-chan Event, error) {
+func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string, images map[string]Part) (<-chan Event, error) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -543,6 +559,13 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string) (<-c
 	toolsPath := r.toolsPath
 	env := slices.Clone(r.env)
 	effort := r.effort
+	if r.images == nil {
+		r.images = map[string]Part{}
+	}
+	for id, im := range images {
+		r.images[id] = im
+	}
+	hasImages := len(r.images) > 0
 	r.mu.Unlock()
 
 	if sessionID == "" {
@@ -556,7 +579,7 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string) (<-c
 		}
 	}
 
-	toolBytes, _ := json.Marshal(bridgeTools(req))
+	toolBytes, _ := json.Marshal(claudeInteractiveTools(req, hasImages))
 	if err := os.WriteFile(toolsPath, toolBytes, 0o600); err != nil {
 		return nil, err
 	}
@@ -1174,7 +1197,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 						r.mu.Lock()
 						search := r.search != nil && name == r.searchName
 						r.mu.Unlock()
-						if !ok || search {
+						if !ok || search || name == interactiveImageTool {
 							continue
 						}
 						theirs = true
@@ -1243,7 +1266,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				r.mu.Unlock()
 				// magpie answers its own web search, as Claude Code does
 				// its WebSearch
-				if !ok || search {
+				if !ok || search || r.interactive && name == interactiveImageTool {
 					own[e.Index] = true
 					continue
 				}
@@ -1376,32 +1399,73 @@ func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 	return closeBlocks(blocks, &text), nil
 }
 
-// renderClaudeBridgePrompt flattens the prompt blocks into the text accepted
-// by the experimental interactive bridge. Image/file transport is deliberately
-// not guessed here: callers get an explicit error until the PTY backend has a
-// tested attachment path.
+// renderClaudeBridgePrompt flattens a prompt for the experimental interactive
+// bridge. Inline images are named in text and exposed through a private MCP
+// tool, rather than enabling Claude Code's unrestricted built-in Read tool on
+// the VPS.
 func renderClaudeBridgePrompt(req *Request) (string, error) {
+	prompt, _, err := renderClaudeBridgePromptWithImages(req)
+	return prompt, err
+}
+
+func renderClaudeBridgePromptWithImages(req *Request) (string, map[string]Part, error) {
 	blocks, err := renderClaudePrompt(req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return flattenClaudeBridgeBlocks(blocks)
+	return flattenClaudeBridgeBlocksWithImages(blocks)
 }
 
 func renderClaudeBridgeTurn(msgs []Message) (string, error) {
-	return flattenClaudeBridgeBlocks(renderClaudeTurn(msgs))
+	prompt, _, err := renderClaudeBridgeTurnWithImages(msgs)
+	return prompt, err
+}
+
+func renderClaudeBridgeTurnWithImages(msgs []Message) (string, map[string]Part, error) {
+	return flattenClaudeBridgeBlocksWithImages(renderClaudeTurn(msgs))
 }
 
 func flattenClaudeBridgeBlocks(blocks []map[string]any) (string, error) {
+	prompt, _, err := flattenClaudeBridgeBlocksWithImages(blocks)
+	return prompt, err
+}
+
+func flattenClaudeBridgeBlocksWithImages(blocks []map[string]any) (string, map[string]Part, error) {
 	var out strings.Builder
+	images := map[string]Part{}
 	for _, block := range blocks {
-		if block["type"] != "text" {
-			return "", errors.New("Claude interactive bridge does not yet support image prompt blocks")
+		switch block["type"] {
+		case "text":
+			text, _ := block["text"].(string)
+			out.WriteString(text)
+		case "image":
+			source, _ := block["source"].(map[string]any)
+			kind, _ := source["type"].(string)
+			if kind != "base64" {
+				return "", nil, errors.New("Claude interactive bridge does not yet support URL image prompt blocks")
+			}
+			data, _ := source["data"].(string)
+			if data == "" {
+				return "", nil, errors.New("Claude interactive bridge received an empty image prompt block")
+			}
+			mediaType, _ := source["media_type"].(string)
+			im := Part{Kind: Image, MediaType: mediaType, Data: data}
+			id := interactiveImageID(im)
+			images[id] = im
+			fmt.Fprintf(&out, "\n[Attached image id=%s. You MUST call mcp__magpie__%s with {\"id\":%q} to view this image before answering any request that depends on its contents.]\n", id, interactiveImageTool, id)
+		default:
+			return "", nil, fmt.Errorf("Claude interactive bridge does not support %v prompt blocks", block["type"])
 		}
-		text, _ := block["text"].(string)
-		out.WriteString(text)
 	}
-	return out.String(), nil
+	return out.String(), images, nil
+}
+
+func interactiveImageID(p Part) string {
+	h := sha256.New()
+	_, _ = io.WriteString(h, p.MediaType)
+	_, _ = io.WriteString(h, "\x00")
+	_, _ = io.WriteString(h, p.Data)
+	return "img_" + hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // renderClaudeTurn is the user's messages in a conversation Claude Code
@@ -1641,6 +1705,24 @@ func (b *subscriptionBridge) mcpCall(w http.ResponseWriter, r *http.Request) {
 	}
 	if json.Unmarshal(body, &call) != nil || call.ToolCallID == "" {
 		http.Error(w, "invalid tool call", http.StatusBadRequest)
+		return
+	}
+	if run.interactive && call.Name == interactiveImageTool {
+		var a struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(call.Arguments, &a)
+		run.mu.Lock()
+		im, ok := run.images[a.ID]
+		run.mu.Unlock()
+		if !ok || im.Data == "" {
+			writeJSON(w, 200, mcpToolResult{IsError: true, Content: []map[string]any{{"type": "text", "text": fmt.Sprintf("Unknown attached image id %q", a.ID)}}})
+			return
+		}
+		writeJSON(w, 200, mcpToolResult{Content: []map[string]any{
+			{"type": "text", "text": "Attached image " + a.ID},
+			{"type": "image", "data": im.Data, "mimeType": imageMediaType(im)},
+		}})
 		return
 	}
 	if call.Name == waitTool && run.patience > 0 {
@@ -1947,7 +2029,14 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, from 
 	// text, and its model went on to write its own calls as text.
 	var more []bridgeTool
 	if run != nil && !run.offers(req.Tools) {
-		more = bridgeTools(req)
+		if run.interactive {
+			run.mu.Lock()
+			hasImages := len(run.images) > 0
+			run.mu.Unlock()
+			more = claudeInteractiveTools(req, hasImages)
+		} else {
+			more = bridgeTools(req)
+		}
 	}
 	var events <-chan Event
 	if run != nil {
@@ -2107,5 +2196,30 @@ func bridgeTools(req *Request) []bridgeTool {
 		}
 		tools = append(tools, bridgeTool{Name: t.Name, Description: t.Description, InputSchema: schema})
 	}
+	return tools
+}
+
+// claudeInteractiveTools adds the PTY transport's private image-viewing tool
+// when inline prompt images are present. The tool is answered entirely inside
+// Magpie and is never surfaced to the caller.
+func claudeInteractiveTools(req *Request, hasImages bool) []bridgeTool {
+	tools := bridgeTools(req)
+	if !hasImages {
+		return tools
+	}
+	// The name is reserved by the interactive transport. If a caller happened
+	// to offer the same name, replace it rather than exposing duplicate MCP
+	// tools with ambiguous semantics.
+	kept := tools[:0]
+	for _, t := range tools {
+		if t.Name != interactiveImageTool {
+			kept = append(kept, t)
+		}
+	}
+	tools = append(kept, bridgeTool{
+		Name:        interactiveImageTool,
+		Description: "View an image attached to the current conversation. Call this tool with the attachment id shown in the prompt before answering questions that depend on that image's contents.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}`),
+	})
 	return tools
 }
