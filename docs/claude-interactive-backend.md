@@ -32,9 +32,12 @@ existing transcript. Upstream 0.2.2 can miss that transcript and wait for a
 fresh one, which can deadlock resumed MCP tool calls. It also installs
 SIGINT/SIGTERM cleanup handlers in print mode; without those handlers Magpie
 can terminate the wrapper while leaving its detached tmux/Claude TUI alive.
-Finally, it retries prompt submission when Claude Code leaves pasted text in
-the bottom input editor after the first synthetic Enter; this was observed on
-large/multiline prompts in Claude Code 2.1.287.
+Finally, it waits for a pasted prompt to become visible in Claude Code's
+bottom input editor before sending the synthetic Enter, then retries Enter
+only while that bottom prompt still contains text. This avoids a race where a
+large/multiline paste is still being materialized when Enter is sent, leaving
+the entire request sitting unsubmitted at `❯` indefinitely. The race was
+observed on Claude Code 2.1.287.
 
 The patch is generated with zero lines of unified context so the patch file
 itself does not contain whitespace-only diff context lines. Apply it with:
