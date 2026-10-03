@@ -48,6 +48,7 @@ import (
 
 type subscriptionBridge struct {
 	mu      sync.Mutex
+	stateMu sync.Mutex
 	runs    map[string]*subscriptionRun // callback token → run
 	calls   map[string]*subscriptionRun // tool_use id → run
 	idle    map[string]*subscriptionRun // conversation so far (turnKey) → run
@@ -103,12 +104,18 @@ type subscriptionRun struct {
 	cmd    *exec.Cmd
 	tree   *proc.Tree // cmd once started, with all it starts
 	tmp    string
+	// persistentWork is a stable cwd for an outer interactive conversation.
+	// Claude Code indexes sessions by project/cwd, so a fresh /tmp directory
+	// on every gateway process restart makes --resume unable to find the old
+	// session even when its session id was persisted.
+	persistentWork bool
 
 	// interactive is an experimental transport in which an outer bridge
 	// drives the real Claude Code TUI inside a PTY. sessionID is the Claude
 	// session the bridge reports, used to resume the next turn.
 	interactive   bool
 	sessionID     string
+	outerSession  string
 	binary        string
 	mcpConfig     string
 	toolsPath     string
@@ -317,7 +324,7 @@ func callbackBaseURL() string {
 	return "http://" + host + ":" + port
 }
 
-func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, configDir, owner string) (*subscriptionRun, <-chan Event, error) {
+func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, configDir, owner, outerSession string) (*subscriptionRun, <-chan Event, error) {
 	binary, interactive, err := claudeSubscriptionBinary()
 	if err != nil {
 		return nil, nil, err
@@ -326,18 +333,47 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	if err != nil {
 		return nil, nil, err
 	}
-	b.sweep.Do(func() { go sweepBridgeProjects(claudeConfigDir(), os.TempDir()) })
-	tmp, err := os.MkdirTemp("", "magpie-claude-")
+	// Headless runs deliberately leave no persisted Claude project. Interactive
+	// conversations do: Claude Code resolves --resume inside the project/cwd,
+	// so an outer session needs a stable cwd across Magpie process restarts.
+	if !interactive {
+		b.sweep.Do(func() { go sweepBridgeProjects(claudeConfigDir(), os.TempDir()) })
+	}
+	var tmp string
+	persistentWork := interactive && outerSession != ""
+	if persistentWork {
+		tmp, err = interactiveSessionWorkDir(owner, outerSession)
+	} else {
+		tmp, err = os.MkdirTemp("", "magpie-claude-")
+	}
 	if err != nil {
 		return nil, nil, err
 	}
-	cleanup := func() { _ = os.RemoveAll(tmp) }
+	cleanup := func() {
+		if !persistentWork {
+			_ = os.RemoveAll(tmp)
+		}
+	}
 
 	var bridgePrompt string
 	var bridgeImages map[string]Part
+	var resumeID string
 	var tools []bridgeTool
 	if interactive {
-		bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
+		// A clean persisted mapping lets a gateway process restart reconnect the
+		// outer client conversation to the same real Claude session. Only the
+		// messages after the last completed assistant checkpoint are submitted;
+		// replaying the whole caller history would both duplicate context and
+		// destroy the prompt-cache prefix the inner session already owns.
+		if saved, ok := b.interactiveSession(owner, outerSession); ok && !saved.Dirty && saved.ContextKey == turnKey(owner, req, nil) {
+			if since, ok := conversationSuffixAfter(owner, req.Messages, saved.ConvKey); ok {
+				bridgePrompt, bridgeImages, err = renderClaudeBridgeTurnWithImages(since)
+				resumeID = saved.SessionID
+			}
+		}
+		if resumeID == "" {
+			bridgePrompt, bridgeImages, err = renderClaudeBridgePromptWithImages(req)
+		}
 		if err != nil {
 			cleanup()
 			return nil, nil, err
@@ -346,21 +382,25 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	} else {
 		tools = bridgeTools(req)
 	}
-	toolsPath := filepath.Join(tmp, "tools.json")
+	token := randomToken()
+	toolsName := "tools.json"
+	if persistentWork {
+		toolsName = "tools-" + token[:16] + ".json"
+	}
+	toolsPath := filepath.Join(tmp, toolsName)
 	toolBytes, _ := json.Marshal(tools)
 	if err := os.WriteFile(toolsPath, toolBytes, 0o600); err != nil {
 		cleanup()
 		return nil, nil, err
 	}
 
-	token := randomToken()
 	callback := callbackBaseURL() + "/_magpie/claude-mcp/" + token
 	mcpConfig, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
 		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callback, toolsPath}},
 	}})
 	var args []string
 	if interactive {
-		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, "")
+		args = claudeInteractiveCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch, resumeID)
 	} else {
 		args = claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
 	}
@@ -396,9 +436,10 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 
 	run := &subscriptionRun{
 		bridge: b, token: token, model: model, cmd: cmd, tmp: tmp,
-		interactive: interactive, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
-		images:  bridgeImages,
-		pending: map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
+		interactive: interactive, sessionID: resumeID, outerSession: outerSession, binary: binary, mcpConfig: string(mcpConfig), toolsPath: toolsPath, env: slices.Clone(env),
+		persistentWork: persistentWork,
+		images:         bridgeImages,
+		pending:        map[string]chan mcpToolResult{}, stdin: stdin, owner: owner, effort: req.Effort,
 	}
 	if interactive {
 		run.outputDone = make(chan struct{})
@@ -410,6 +451,9 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, con
 	b.mu.Lock()
 	b.runs[token] = run
 	b.mu.Unlock()
+	if interactive && resumeID != "" {
+		b.markInteractiveSessionDirty(owner, outerSession)
+	}
 
 	if err := run.launch(); err != nil {
 		b.removeRun(run)
@@ -472,15 +516,12 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 		return nil, nil
 	}
 	if run.interactive {
-		// The PTY bridge starts one wrapper process per turn and resumes the
-		// same real Claude session. Dynamic effort changes are deliberately
-		// outside the first experimental scope: restart from the full caller
-		// conversation instead of pretending the interactive TUI accepted the
-		// headless SDK control message.
-		if req.Effort != run.effort {
-			run.abort()
-			return nil, nil
-		}
+		// Each interactive turn starts a fresh wrapper around the same persisted
+		// Claude session, so a new --effort flag can safely apply to the resumed
+		// TUI without replaying the whole conversation into a new session.
+		run.mu.Lock()
+		run.effort = req.Effort
+		run.mu.Unlock()
 		prompt, images, err := renderClaudeBridgeTurnWithImages(since)
 		if err != nil {
 			run.abort()
@@ -561,6 +602,9 @@ func (r *subscriptionRun) startInteractiveTurn(req *Request, prompt string, imag
 	}
 	hasImages := len(r.images) > 0
 	r.mu.Unlock()
+	if r.outerSession != "" {
+		r.bridge.markInteractiveSessionDirty(r.owner, r.outerSession)
+	}
 
 	if sessionID == "" {
 		return nil, errors.New("Claude interactive bridge returned no session id to resume")
@@ -680,8 +724,10 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	}
 	b.idle[key] = r
 	r.idleKey, r.idleAt = key, time.Now()
+	var convKey string
 	if keys := conversationKeys(r.owner, append(req.Messages[:len(req.Messages):len(req.Messages)], reply)); len(keys) > 0 {
-		r.convKey = keys[len(keys)-1]
+		convKey = keys[len(keys)-1]
+		r.convKey = convKey
 	}
 	for len(b.idle) > idleMost {
 		var oldest *subscriptionRun
@@ -695,6 +741,14 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 		drop = append(drop, oldest)
 	}
 	b.mu.Unlock()
+	if r.interactive && r.outerSession != "" && convKey != "" {
+		r.mu.Lock()
+		sessionID := r.sessionID
+		r.mu.Unlock()
+		b.saveInteractiveSession(r.owner, r.outerSession, interactiveSessionEntry{
+			SessionID: sessionID, ConvKey: convKey, ContextKey: turnKey(r.owner, req, nil),
+		})
+	}
 	r.timer.Reset(idleLongest)
 	for _, run := range drop {
 		run.abort()
@@ -1929,7 +1983,11 @@ func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
 		}
 	}
 	b.mu.Unlock()
-	_ = os.RemoveAll(run.tmp)
+	if run.persistentWork {
+		_ = os.Remove(run.toolsPath)
+	} else {
+		_ = os.RemoveAll(run.tmp)
+	}
 }
 
 // ownHome marks a run's owner as Claude Code's own sign-in, run in its
@@ -1937,6 +1995,7 @@ func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
 const ownHome = "own"
 
 func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, model string, body []byte, usage *Usage) (int, string) {
+	outerSession := sessionOf(r.Header)
 	start := func(ctx context.Context, req *Request) (*subscriptionRun, <-chan Event, error) {
 		ctx = p.Via(ctx) // the account's own proxy, its CLI run's too
 		owner := p.ID + "\x00" + p.Account.User
@@ -1963,7 +2022,7 @@ func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request,
 		if err != nil {
 			return nil, nil, err
 		}
-		return s.subscription.start(ctx, req, model, dir, owner)
+		return s.subscription.start(ctx, req, model, dir, owner, outerSession)
 	}
 	return s.serveSubscription(w, r, from, "Claude Code", model, body, usage, start)
 }

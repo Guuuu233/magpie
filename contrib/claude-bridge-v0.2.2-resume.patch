@@ -21,7 +21,7 @@ index 55b1b6b..cfbc33d 100644
 +}
 +
 diff --git a/src/cli.ts b/src/cli.ts
-index 1673770..a751cae 100755
+index 1673770..cf70cd0 100755
 --- a/src/cli.ts
 +++ b/src/cli.ts
 @@ -23,0 +24 @@ import {
@@ -91,17 +91,44 @@ index 1673770..a751cae 100755
 +  shutdown();
 @@ -1044,0 +1097 @@ async function startTranscriptTail(): Promise<void> {
 +      (resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
-@@ -1204,2 +1256,0 @@ function startRepl(): void {
+@@ -1080 +1133,2 @@ async function startTranscriptTail(): Promise<void> {
+-      ctrl.signal
++      ctrl.signal,
++      Boolean(resumedSessionId)
+@@ -1204,2 +1257,0 @@ function startRepl(): void {
 -  process.on("SIGINT", () => shutdown());
 -  process.on("SIGTERM", () => shutdown());
-@@ -1221,0 +1273,5 @@ desplegaDebug("run state created", { runDir });
+@@ -1221,0 +1274,5 @@ desplegaDebug("run state created", { runDir });
 +// Print mode is also a long-lived wrapper while Claude is waiting on MCP
 +// tools. Handle termination in every mode so Magpie can ask the wrapper to
 +// tear down the detached tmux/PTY before falling back to a hard process kill.
 +process.on("SIGINT", () => shutdown());
 +process.on("SIGTERM", () => shutdown());
+diff --git a/src/test-transcript.ts b/src/test-transcript.ts
+index a57ff33..66c9d97 100644
+--- a/src/test-transcript.ts
++++ b/src/test-transcript.ts
+@@ -150,0 +151,18 @@ ok("tailTranscriptLines preserves split UTF-8 character", utf8Lines[0] === utf8L
++const resumedTailPath = join(projectFolder, "resumed-tail.jsonl");
++writeFileSync(resumedTailPath, JSON.stringify({ type: "assistant", message: "historical" }) + "\n");
++const resumedTailCtrl = new AbortController();
++const resumedTailLines: string[] = [];
++const resumedTail = tailTranscriptLines(
++  resumedTailPath,
++  line => resumedTailLines.push(line),
++  resumedTailCtrl.signal,
++  true
++);
++await new Promise(r => setTimeout(r, 150));
++ok("tailTranscriptLines fromEnd skips historical rows", resumedTailLines.length === 0);
++appendFileSync(resumedTailPath, JSON.stringify({ type: "assistant", message: "new" }) + "\n");
++await new Promise(r => setTimeout(r, 250));
++resumedTailCtrl.abort();
++await resumedTail;
++ok("tailTranscriptLines fromEnd emits newly appended rows", resumedTailLines.length === 1 && resumedTailLines[0]?.includes("\"new\"") === true);
++
 diff --git a/src/transcript.ts b/src/transcript.ts
-index f1e9480..cc4a298 100644
+index f1e9480..747d7f4 100644
 --- a/src/transcript.ts
 +++ b/src/transcript.ts
 @@ -89,0 +90,16 @@ export async function listAllTranscriptPaths(root: string = claudeProjectsRoot()
@@ -121,3 +148,15 @@ index f1e9480..cc4a298 100644
 +  return null;
 +}
 +
+@@ -181 +197,2 @@ export async function tailTranscriptLines(
+-  signal: AbortSignal
++  signal: AbortSignal,
++  fromEnd: boolean = false
+@@ -183,0 +201,7 @@ export async function tailTranscriptLines(
++  if (fromEnd) {
++    try {
++      offset = statSync(transcriptPath).size;
++    } catch {
++      offset = 0;
++    }
++  }
