@@ -83,22 +83,32 @@ index 1673770..cf70cd0 100755
 +  return /^\s*(?:❯|>)\s*\S/.test(prompts[prompts.length - 1]!);
 +}
 +
-@@ -827,0 +875,5 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
+@@ -763,4 +816,8 @@ function currentTurnTranscriptRows(rows: TranscriptRow[]): TranscriptRow[] | null {
+-  if (!forkedSession) return rows;
++  // Both --fork-session and ordinary --resume inherit rows that predate the
++  // submitted prompt. Live resume tailing starts at EOF, but the Stop-hook
++  // catch-up rereads the whole transcript; without this boundary it re-emits
++  // historical assistant/tool rows after the current turn.
++  if (!forkedSession && !resumedSessionId) return rows;
+   if (!initialMessage) return null;
+   return transcriptRowsFromLastUserPrompt(rows, initialMessage);
+ }
+@@ -827,0 +879,5 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
 +  // stream-json compatibility has already emitted its terminal result. Tear
 +  // down the one-shot PTY here instead of relying on the caller to signal us;
 +  // otherwise a fast HTTP client can finish while the detached tmux/Claude
 +  // session survives the wrapper turn.
 +  shutdown();
-@@ -1044,0 +1097 @@ async function startTranscriptTail(): Promise<void> {
+@@ -1044,0 +1101 @@ async function startTranscriptTail(): Promise<void> {
 +      (resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
-@@ -1080 +1133,2 @@ async function startTranscriptTail(): Promise<void> {
+@@ -1080 +1137,2 @@ async function startTranscriptTail(): Promise<void> {
 -      ctrl.signal
 +      ctrl.signal,
 +      Boolean(resumedSessionId)
-@@ -1204,2 +1257,0 @@ function startRepl(): void {
+@@ -1204,2 +1261,0 @@ function startRepl(): void {
 -  process.on("SIGINT", () => shutdown());
 -  process.on("SIGTERM", () => shutdown());
-@@ -1221,0 +1274,5 @@ desplegaDebug("run state created", { runDir });
+@@ -1221,0 +1278,5 @@ desplegaDebug("run state created", { runDir });
 +// Print mode is also a long-lived wrapper while Claude is waiting on MCP
 +// tools. Handle termination in every mode so Magpie can ask the wrapper to
 +// tear down the detached tmux/PTY before falling back to a hard process kill.
