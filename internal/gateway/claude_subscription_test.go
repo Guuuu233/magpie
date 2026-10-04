@@ -846,7 +846,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-p
 	}
 }
 
-func TestClaudeInteractiveMissingStateRefusesEstablishedHistoryReplay(t *testing.T) {
+func TestClaudeInteractiveMissingStateBootstrapsEstablishedHistorySafely(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")
 	}
@@ -858,8 +858,8 @@ func TestClaudeInteractiveMissingStateRefusesEstablishedHistoryReplay(t *testing
 	script := `#!/bin/sh
 prompt=$(cat)
 printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
-echo '{"type":"assistant","session_id":"sess-new","uuid":"row-new","message":{"id":"m-new","model":"claude-opus-5-5","content":[{"type":"text","text":"fresh"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
-echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-new","stop_reason":"end_turn","result":"fresh"}'
+echo '{"type":"assistant","session_id":"sess-import","uuid":"row-import","message":{"id":"m-import","model":"claude-opus-5-5","content":[{"type":"text","text":"IMPORTED"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-import","stop_reason":"end_turn","result":"IMPORTED"}'
 `
 	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -868,21 +868,34 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-n
 	t.Setenv("FAKE_BRIDGE_LOG", logPath)
 	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
 	body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[` +
-		`{"role":"user","content":"old user"},` +
-		`{"role":"assistant","content":"old assistant"},` +
-		`{"role":"user","content":"new user"}]}`
+		`{"role":"user","content":"old user context"},` +
+		`{"role":"assistant","content":[{"type":"text","text":"old assistant context"},{"type":"tool_use","id":"toolu_old","name":"read","input":{"path":"SHOULD_NOT_REPLAY"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_old","content":"STALE_TOOL_OUTPUT"}]},` +
+		`{"role":"user","content":"current real request"}]}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
 	req.Header.Set(SessionHeader, "desktop-session-missing-established")
 	rec := httptest.NewRecorder()
 	var u Usage
-	code, why := New().serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u)
-	if code != 502 || !strings.Contains(why+rec.Body.String(), "state_missing on established conversation") {
-		t.Fatalf("missing established state = %d %s %s", code, why, rec.Body.String())
+	if code, why := New().serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+		t.Fatalf("historical bootstrap = %d %s: %s", code, why, rec.Body.String())
 	}
-	if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
-		t.Fatalf("missing established state replayed history into a fresh bridge:\n%s", b)
-	} else if err != nil && !os.IsNotExist(err) {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
 		t.Fatal(err)
+	}
+	log := string(data)
+	for _, want := range []string{"historical_conversation_import", "old user context", "old assistant context", "current real request"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("historical bootstrap missing %q:\n%s", want, log)
+		}
+	}
+	for _, stale := range []string{"STALE_TOOL_OUTPUT", "SHOULD_NOT_REPLAY", "toolu_old"} {
+		if strings.Contains(log, stale) {
+			t.Fatalf("historical bootstrap replayed stale tool material %q:\n%s", stale, log)
+		}
+	}
+	if strings.Contains(log, "--resume") {
+		t.Fatalf("historical bootstrap unexpectedly resumed a nonexistent session:\n%s", log)
 	}
 }
 
