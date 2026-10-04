@@ -2169,25 +2169,50 @@ func claudeDesktopSuggestion(req *Request) bool {
 	return false
 }
 
+func claudeDesktopTurnCompanionMessage(m Message) bool {
+	if m.Role != "user" {
+		return false
+	}
+	for _, p := range m.Parts {
+		if p.Kind != Text {
+			continue
+		}
+		text := strings.TrimSpace(p.Text)
+		if strings.HasPrefix(text, "[Your previous response had no visible output.") ||
+			strings.HasPrefix(text, "Your response above was cut off mid-stream.") {
+			return true
+		}
+	}
+	return false
+}
+
 func claudeDesktopTurnCompanionSuffix(req *Request) []Message {
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		m := req.Messages[i]
 		if m.Role != "user" {
 			continue
 		}
-		for _, p := range m.Parts {
-			if p.Kind != Text {
-				continue
-			}
-			text := strings.TrimSpace(p.Text)
-			if strings.HasPrefix(text, "[Your previous response had no visible output.") ||
-				strings.HasPrefix(text, "Your response above was cut off mid-stream.") {
-				return []Message{m}
-			}
+		if claudeDesktopTurnCompanionMessage(m) {
+			return []Message{m}
 		}
 		return nil
 	}
 	return nil
+}
+
+func claudeDesktopFailedTurnCompanionReply(m Message) bool {
+	if m.Role != "assistant" {
+		return false
+	}
+	var text strings.Builder
+	for _, p := range m.Parts {
+		if p.Kind == Text {
+			text.WriteString(p.Text)
+		}
+	}
+	s := strings.TrimSpace(text.String())
+	return strings.HasPrefix(s, "API Error: 502 ") &&
+		strings.Contains(s, "Claude interactive persisted resume failed: dirty; refusing full history replay")
 }
 
 func claudeDesktopSuggestionRequest(req *Request) *Request {

@@ -1011,6 +1011,19 @@ func TestClaudeInteractiveRestoreReasons(t *testing.T) {
 	if _, _, got := b.restoreInteractiveSession(owner, "suffix", &suffixReq); got != interactiveRestoreSuffixRejected {
 		t.Fatalf("suffix rejected reason = %q", got)
 	}
+
+	b.saveInteractiveSession(owner, "failed-companion", interactiveSessionEntry{
+		SessionID: "sess-companion", ConvKey: keys[0], ReplyKey: replyKey, ContextKey: contextKey,
+	})
+	failedCompanionReq := baseReq
+	failedCompanionReq.Messages = append(slices.Clone(base),
+		Message{Role: "user", Parts: []Part{{Kind: Text, Text: "Your response above was cut off mid-stream. Resume directly from where it stops — no apology, no recap. If none of it survived, answer the request from the start."}}},
+		Message{Role: "assistant", Parts: []Part{{Kind: Text, Text: "API Error: 502 US VPS Claude: Claude Code: Claude interactive persisted resume failed: dirty; refusing full history replay. This is a server-side issue, usually temporary — try again in a moment."}}},
+		Message{Role: "user", Parts: []Part{{Kind: Text, Text: "real next turn"}}},
+	)
+	if _, since, got := b.restoreInteractiveSession(owner, "failed-companion", &failedCompanionReq); got != interactiveRestoreExact || len(since) != 1 || since[0].Role != "user" || since[0].Parts[0].Text != "real next turn" {
+		t.Fatalf("failed companion transport artifact should be skipped: status=%q suffix=%#v", got, since)
+	}
 }
 
 func TestClaudeInteractiveContextRefreshCarriesCurrentInstructionsOnly(t *testing.T) {

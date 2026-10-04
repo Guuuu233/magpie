@@ -313,6 +313,17 @@ func safeConversationSuffixAfterDetailed(msgs []Message, match int) ([]Message, 
 		return nil, conversationSuffixRejected
 	}
 	since := msgs[match+1:]
+	// Claude Desktop may persist a failed hidden turn-companion request plus
+	// the synthetic 502 assistant error it received from Magpie. Neither row
+	// exists in the inner Claude transcript. Skip only this exact transport
+	// artifact pair so the next real user turn can resume the saved checkpoint
+	// without replaying or blessing arbitrary assistant history.
+	for len(since) >= 2 && claudeDesktopTurnCompanionMessage(since[0]) && claudeDesktopFailedTurnCompanionReply(since[1]) {
+		since = since[2:]
+	}
+	if len(since) == 0 {
+		return nil, conversationSuffixRejected
+	}
 	for _, m := range since {
 		if m.Role == "assistant" {
 			return nil, conversationSuffixRejected
