@@ -2176,7 +2176,12 @@ func claudeDesktopTurnCompanionSuffix(req *Request) []Message {
 			continue
 		}
 		for _, p := range m.Parts {
-			if p.Kind == Text && strings.HasPrefix(strings.TrimSpace(p.Text), "[Your previous response had no visible output.") {
+			if p.Kind != Text {
+				continue
+			}
+			text := strings.TrimSpace(p.Text)
+			if strings.HasPrefix(text, "[Your previous response had no visible output.") ||
+				strings.HasPrefix(text, "Your response above was cut off mid-stream.") {
 				return []Message{m}
 			}
 		}

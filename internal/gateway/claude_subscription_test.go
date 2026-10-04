@@ -617,6 +617,22 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s",
 	}
 }
 
+func TestClaudeDesktopTurnCompanionDetection(t *testing.T) {
+	for _, text := range []string{
+		"[Your previous response had no visible output. Please continue and produce a user-visible response.]",
+		"Your response above was cut off mid-stream. Resume directly from where it stops — no apology, no recap. If none of it survived, answer the request from the start.",
+	} {
+		req := &Request{Messages: []Message{{Role: "user", Parts: []Part{{Kind: Text, Text: text}}}}}
+		if got := claudeDesktopTurnCompanionSuffix(req); len(got) != 1 || got[0].Role != "user" {
+			t.Fatalf("turn companion %q not detected: %#v", text, got)
+		}
+	}
+	req := &Request{Messages: []Message{{Role: "user", Parts: []Part{{Kind: Text, Text: "normal user message"}}}}}
+	if got := claudeDesktopTurnCompanionSuffix(req); got != nil {
+		t.Fatalf("ordinary user message detected as turn companion: %#v", got)
+	}
+}
+
 func TestClaudeDesktopTurnCompanionResumesDirtyInteractiveSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")
@@ -652,7 +668,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-m
 
 	s := New()
 	t.Cleanup(s.subscription.abortAll)
-	companion := "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+	companion := "Your response above was cut off mid-stream. Resume directly from where it stops — no apology, no recap. If none of it survived, answer the request from the start."
 	body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[` +
 		`{"role":"user","content":"old outer history"},` +
 		`{"role":"assistant","content":"rewritten outer reply"},` +

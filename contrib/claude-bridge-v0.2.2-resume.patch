@@ -2,7 +2,10 @@ diff --git a/src/args.ts b/src/args.ts
 index 55b1b6b..cfbc33d 100644
 --- a/src/args.ts
 +++ b/src/args.ts
-@@ -296,0 +297,17 @@ export function formatClaudeHelp(claudeHelp: string): string {
+@@ -294,6 +294,23 @@ export function formatClaudeHelp(claudeHelp: string): string {
+   ].join("\n");
+ }
+ 
 +// Return an explicit Claude session id passed to --resume/-r. A bare resume
 +// asks Claude Code to choose a session itself, which is not deterministic
 +// enough for the bridge to locate the existing transcript before launch.
@@ -20,18 +23,61 @@ index 55b1b6b..cfbc33d 100644
 +  return undefined;
 +}
 +
+ type ExtractedClaudeArgs = {
+   version: boolean;
+   print: boolean;
 diff --git a/src/cli.ts b/src/cli.ts
-index 1673770..cf70cd0 100755
+index 1673770..9030ad4 100755
 --- a/src/cli.ts
 +++ b/src/cli.ts
-@@ -23,0 +24 @@ import {
+@@ -21,10 +21,13 @@ import { randomUUID } from "node:crypto";
+ import { preAcceptProject, writeWorkdirSettings } from "./preaccept.ts";
+ import { claudeAuthEnvArgs, claudeUnsetEnvArgs } from "./auth-env.ts";
+ import {
 +  findTranscriptBySessionId,
-@@ -36 +37 @@ import { formatEnvelope } from "./view.ts";
+   isTurnDurationRow,
+   listAllTranscriptPaths,
+   projectFolderFromTranscript,
+   readTranscript,
++  transcriptRowsAfterBaseline,
++  transcriptRowsFromLastUserPrompt,
+   sessionIdFromPath,
+   tailTranscript,
+   tailTranscriptLines,
+@@ -33,7 +36,7 @@ import {
+   type TranscriptRow,
+ } from "./transcript.ts";
+ import { formatEnvelope } from "./view.ts";
 -import { formatClaudeHelp, formatWrapperHelp, parseCliArgs, type OutputFormat } from "./args.ts";
 +import { claudeResumeSessionId, formatClaudeHelp, formatWrapperHelp, parseCliArgs, type OutputFormat } from "./args.ts";
-@@ -151,0 +153 @@ const forwardedClaudeArgs = jsonSchema
+ import {
+   extractAndValidateStructuredOutput,
+   loadJsonSchema,
+@@ -149,6 +152,20 @@ const forwardedClaudeArgs = jsonSchema
+       makeJsonSchemaSystemPrompt(jsonSchema.compact)
+     )
+   : args.claudeArgs;
 +const resumedSessionId = claudeResumeSessionId(forwardedClaudeArgs);
-@@ -401 +403,12 @@ function sendPromptToTmux(text: string, id: string): boolean {
++const forkedSession = Boolean(resumedSessionId && forwardedClaudeArgs.includes("--fork-session"));
++let resumedTranscriptPathBeforeLaunch: string | null = null;
++let resumedTranscriptBaselineRows: number | null = null;
++if (resumedSessionId && !forkedSession) {
++  try {
++    resumedTranscriptPathBeforeLaunch = await findTranscriptBySessionId(resumedSessionId);
++    if (resumedTranscriptPathBeforeLaunch) {
++      resumedTranscriptBaselineRows = (await readTranscript(resumedTranscriptPathBeforeLaunch)).length;
++    }
++  } catch {
++    // Fall back to prompt-boundary detection below; never replay inherited rows.
++  }
++}
+ 
+ const runId = new Date().toISOString().replace(/[:.]/g, "-") + "-" + randomUUID().slice(0, 8);
+ const runDir = join(resolveRunRoot(targetCwd), runId);
+@@ -398,7 +415,18 @@ function sendPromptToTmux(text: string, id: string): boolean {
+     return failTmuxSend("paste prompt buffer", paste);
+   }
+ 
 -  sleepSync(TMUX_SUBMIT_DELAY_MS);
 +  // A tmux paste returns before Claude Code has necessarily materialized a
 +  // large/multiline paste in its editor. Sending Enter too early is then lost,
@@ -45,7 +91,13 @@ index 1673770..cf70cd0 100755
 +    });
 +  }
 +
-@@ -409 +422,20 @@ function sendPromptToTmux(text: string, id: string): boolean {
+   const enter = spawnSync(tmuxPath, ["send-keys", "-t", sessionName, "Enter"], {
+     encoding: "utf8",
+   });
+@@ -406,10 +434,44 @@ function sendPromptToTmux(text: string, id: string): boolean {
+     return failTmuxSend("submit prompt", enter);
+   }
+ 
 -  desplegaDebug("sent prompt through tmux", { id, length: text.length });
 +  // Claude Code can still occasionally leave the paste in the editor after a
 +  // synthetic Enter. Re-check a few times; only retry while non-empty text is
@@ -67,7 +119,9 @@ index 1673770..cf70cd0 100755
 +  }
 +
 +  desplegaDebug("sent prompt through tmux", { id, length: text.length, ready });
-@@ -412,0 +445,15 @@ function sendPromptToTmux(text: string, id: string): boolean {
+   return true;
+ }
+ 
 +function waitForPendingPrompt(timeoutMs: number): boolean {
 +  const deadline = Date.now() + timeoutMs;
 +  do {
@@ -83,42 +137,216 @@ index 1673770..cf70cd0 100755
 +  return /^\s*(?:❯|>)\s*\S/.test(prompts[prompts.length - 1]!);
 +}
 +
-@@ -763,4 +816,8 @@ function currentTurnTranscriptRows(rows: TranscriptRow[]): TranscriptRow[] | null {
--  if (!forkedSession) return rows;
-+  // Both --fork-session and ordinary --resume inherit rows that predate the
-+  // submitted prompt. Live resume tailing starts at EOF, but the Stop-hook
-+  // catch-up rereads the whole transcript; without this boundary it re-emits
-+  // historical assistant/tool rows after the current turn.
-+  if (!forkedSession && !resumedSessionId) return rows;
-   if (!initialMessage) return null;
-   return transcriptRowsFromLastUserPrompt(rows, initialMessage);
+ function failTmuxSend(
+   action: string,
+   result: { status: number | null; stderr?: unknown }
+@@ -720,16 +782,43 @@ function runtimeStopFailureMessage(stopEvent: RuntimeStopEvent): string {
+   return "Claude StopFailure hook fired before the Stop hook produced a result.";
  }
-@@ -827,0 +879,5 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
+ 
++function currentTurnTranscriptRows(rows: TranscriptRow[]): TranscriptRow[] | null {
++  // Ordinary --resume appends to a transcript that already existed before this
++  // wrapper launched. Prefer that pre-launch row boundary: Claude Code may
++  // normalize a large pasted prompt in the persisted user row, so exact prompt
++  // matching can reject an otherwise complete turn at Stop-hook catch-up.
++  if (!forkedSession && resumedSessionId) {
++    if (resumedTranscriptBaselineRows !== null) {
++      return transcriptRowsAfterBaseline(rows, resumedTranscriptBaselineRows);
++    }
++    if (!initialMessage) return null;
++    return transcriptRowsFromLastUserPrompt(rows, initialMessage);
++  }
++  // A fork creates a new transcript containing inherited rows, so there is no
++  // old-file baseline to trust; retain the fail-closed prompt boundary there.
++  if (!forkedSession) return rows;
++  if (!initialMessage) return null;
++  return transcriptRowsFromLastUserPrompt(rows, initialMessage);
++}
++
+ async function hydrateTranscriptFromStopEvent(stopEvent: RuntimeStopEvent): Promise<void> {
+   const transcriptPath = stopEvent.transcript_path;
+   if (!transcriptPath) return;
+   transcriptSessionId = sessionIdFromPath(transcriptPath);
+   try {
+-    const rows = await readTranscript(transcriptPath);
++    const allRows = await readTranscript(transcriptPath);
++    const rows = currentTurnTranscriptRows(allRows);
++    if (!rows) {
++      pendingPrintFailure = {
++        message: "Fork transcript did not contain the submitted prompt; refusing inherited-history replay.",
++      };
++      return;
++    }
+     rows.forEach((row, index) => handleTranscriptRow(row, JSON.stringify(row)));
+     desplegaDebug("hydrated final transcript from Stop hook", {
+       transcriptPath,
+       rows: rows.length,
++      inheritedRowsSkipped: allRows.length - rows.length,
+     });
+   } catch (err) {
+     desplegaDebug("failed to hydrate transcript from Stop hook", {
+@@ -802,7 +891,13 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
+   }
+   if (stopEvent.transcript_path) {
+     try {
+-      emitClaudeStreamCatchUp(await readTranscript(stopEvent.transcript_path));
++      const allRows = await readTranscript(stopEvent.transcript_path);
++      const rows = currentTurnTranscriptRows(allRows);
++      if (!rows) {
++        failPrint("Fork transcript did not contain the submitted prompt; refusing inherited-history replay.");
++        return false;
++      }
++      emitClaudeStreamCatchUp(rows);
+     } catch (err) {
+       desplegaDebug("failed to drain transcript for stream-json result", {
+         error: (err as Error).message,
+@@ -825,6 +920,11 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
+       })
+     ) + "\n"
+   );
 +  // stream-json compatibility has already emitted its terminal result. Tear
 +  // down the one-shot PTY here instead of relying on the caller to signal us;
 +  // otherwise a fast HTTP client can finish while the detached tmux/Claude
 +  // session survives the wrapper turn.
 +  shutdown();
-@@ -1044,0 +1101 @@ async function startTranscriptTail(): Promise<void> {
-+      (resumedSessionId ? await findTranscriptBySessionId(resumedSessionId) : null) ??
-@@ -1080 +1137,2 @@ async function startTranscriptTail(): Promise<void> {
+   return true;
+ }
+ 
+@@ -1042,7 +1142,10 @@ async function startTranscriptTail(): Promise<void> {
+   let transcriptPath: string;
+   try {
+     transcriptPath =
+-      (compatStreamJsonPrint ? await waitForRuntimeTranscriptPath(1_500) : null) ??
++      (!forkedSession && resumedSessionId
++        ? resumedTranscriptPathBeforeLaunch ?? await findTranscriptBySessionId(resumedSessionId)
++        : null) ??
++      (compatStreamJsonPrint && !forkedSession ? await waitForRuntimeTranscriptPath(1_500) : null) ??
+       await waitForFreshTranscriptForCwd(targetCwd, transcriptsBefore, ctrl.signal);
+   } catch (err) {
+     if (printMode) {
+@@ -1077,7 +1180,8 @@ async function startTranscriptTail(): Promise<void> {
+         handleTranscriptRow(row, line);
+         emitClaudeStreamRow(row);
+       },
 -      ctrl.signal
 +      ctrl.signal,
 +      Boolean(resumedSessionId)
-@@ -1204,2 +1261,0 @@ function startRepl(): void {
+     );
+     return;
+   }
+@@ -1201,8 +1305,6 @@ function startRepl(): void {
+     sendUserMessage(text);
+   });
+   rl.on("close", () => shutdown());
 -  process.on("SIGINT", () => shutdown());
 -  process.on("SIGTERM", () => shutdown());
-@@ -1221,0 +1278,5 @@ desplegaDebug("run state created", { runDir });
+ }
+ 
+ let shuttingDown = false;
+@@ -1219,5 +1321,10 @@ function shutdown(exitCode = 0): void {
+ }
+ 
+ desplegaDebug("run state created", { runDir });
 +// Print mode is also a long-lived wrapper while Claude is waiting on MCP
 +// tools. Handle termination in every mode so Magpie can ask the wrapper to
 +// tear down the detached tmux/PTY before falling back to a hard process kill.
 +process.on("SIGINT", () => shutdown());
 +process.on("SIGTERM", () => shutdown());
+ startTmux();
+ if (!printMode) startRepl();
+diff --git a/src/test-args.ts b/src/test-args.ts
+index 704fbfe..62aa381 100644
+--- a/src/test-args.ts
++++ b/src/test-args.ts
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bun
+-import { formatClaudeHelp, formatWrapperHelp, parseCliArgs } from "./args.ts";
++import { claudeResumeSessionId, formatClaudeHelp, formatWrapperHelp, parseCliArgs } from "./args.ts";
+ 
+ const ok = (label: string, cond: boolean) => {
+   console.log((cond ? "PASS" : "FAIL") + " " + label);
+@@ -119,5 +119,19 @@ ok("--append-system-prompt-file consumes path value", appendFile.claudeArgs.incl
+ ok("--mcp-config not eaten by --append-system-prompt-file", appendFile.claudeArgs.includes("--mcp-config") && appendFile.claudeArgs.includes("/tmp/mcp.json"));
+ ok("downstream flags survive after --append-system-prompt-file", appendFile.claudeArgs.includes("--strict-mcp-config"));
+ 
++ok(
++  "extracts long resume session id from forwarded Claude args",
++  claudeResumeSessionId(["--model", "opus", "--resume", "session-123"]) === "session-123"
++);
++ok(
++  "extracts equals resume session id from forwarded Claude args",
++  claudeResumeSessionId(["--resume=session-456"]) === "session-456"
++);
++ok(
++  "extracts short resume session id from forwarded Claude args",
++  claudeResumeSessionId(["-r", "session-789"]) === "session-789"
++);
++ok("resume without explicit id has no deterministic transcript", claudeResumeSessionId(["--resume"]) === undefined);
++
+ console.log("\nresult: " + (process.exitCode ? "FAIL" : "PASS"));
+ process.exit(process.exitCode ?? 0);
 diff --git a/src/test-transcript.ts b/src/test-transcript.ts
-index a57ff33..66c9d97 100644
+index a57ff33..28bdb5b 100644
 --- a/src/test-transcript.ts
 +++ b/src/test-transcript.ts
-@@ -150,0 +151,18 @@ ok("tailTranscriptLines preserves split UTF-8 character", utf8Lines[0] === utf8L
+@@ -14,9 +14,12 @@ import {
+   listAllTranscriptPaths,
+   listTranscriptPaths,
+   readTranscriptLines,
++  transcriptRowsAfterBaseline,
++  transcriptRowsFromLastUserPrompt,
+   transcriptHasTurnEnd,
+   waitForFreshTranscript,
+   waitForFreshTranscriptForCwd,
++  findTranscriptBySessionId,
+   waitForTranscriptTurnEnd,
+   tailTranscript,
+   tailTranscriptLines,
+@@ -86,6 +89,18 @@ setTimeout(() => {
+ const cwdFound = await waitForFreshTranscriptForCwd(targetCwd, allBefore, undefined, allRoot);
+ ok("waitForFreshTranscriptForCwd finds matching cwd transcript", cwdFound === cwdTranscriptPath);
+ 
++const resumedProject = join(allRoot, "resume-project");
++mkdirSync(resumedProject, { recursive: true });
++const resumedSessionUuid = "00000000-0000-0000-0000-00000000beef";
++const resumedTranscriptPath = join(resumedProject, `${resumedSessionUuid}.jsonl`);
++writeFileSync(resumedTranscriptPath, JSON.stringify({ type: "system", subtype: "init" }) + "\n");
++const resumedFound = await findTranscriptBySessionId(resumedSessionUuid, allRoot);
++ok("findTranscriptBySessionId finds a pre-existing resumed transcript", resumedFound === resumedTranscriptPath);
++ok(
++  "findTranscriptBySessionId returns null for an unknown session",
++  (await findTranscriptBySessionId("00000000-0000-0000-0000-00000000dead", allRoot)) === null
++);
++
+ const seen: TranscriptRow[] = [];
+ const ctrl = new AbortController();
+ const tailPromise = tailTranscript(found, row => seen.push(row), ctrl.signal);
+@@ -117,6 +132,21 @@ ok("user row appears exactly once", userCount === 1);
+ const rawLines = await readTranscriptLines(transcriptPath);
+ ok("readTranscriptLines preserves raw JSONL lines", rawLines[2]?.includes("\"assistant\"") === true);
+ 
++const forkRows: TranscriptRow[] = [
++  { type: "user", message: { role: "user", content: "old prompt" }, uuid: "old-user" },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "old answer" }] }, uuid: "old-assistant" },
++  { type: "user", message: { role: "user", content: "same prompt" }, uuid: "earlier-same" },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "earlier answer" }] }, uuid: "earlier-answer" },
++  { type: "user", message: { role: "user", content: "same prompt" }, uuid: "fork-user" },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "fork answer" }] }, uuid: "fork-assistant" },
++  { type: "system", subtype: "turn_duration", uuid: "fork-end" },
++];
++const currentForkRows = transcriptRowsFromLastUserPrompt(forkRows, "same prompt");
++ok("fork boundary uses the last matching user prompt", currentForkRows?.[0]?.uuid === "fork-user");
++ok("fork boundary drops copied assistant history", currentForkRows?.some(r => r.uuid === "old-assistant" || r.uuid === "earlier-answer") === false);
++ok("fork boundary keeps the new assistant reply", currentForkRows?.some(r => r.uuid === "fork-assistant") === true);
++ok("fork boundary fails closed when prompt is absent", transcriptRowsFromLastUserPrompt(forkRows, "missing prompt") === null);
++
+ const partialPath = join(projectFolder, "partial.jsonl");
+ writeFileSync(partialPath, "");
+ const partialCtrl = new AbortController();
+@@ -148,6 +178,42 @@ utf8Ctrl.abort();
+ await utf8Tail;
+ ok("tailTranscriptLines preserves split UTF-8 character", utf8Lines[0] === utf8Line.toString("utf8").trimEnd());
+ 
 +const resumedTailPath = join(projectFolder, "resumed-tail.jsonl");
 +writeFileSync(resumedTailPath, JSON.stringify({ type: "assistant", message: "historical" }) + "\n");
 +const resumedTailCtrl = new AbortController();
@@ -137,11 +365,35 @@ index a57ff33..66c9d97 100644
 +await resumedTail;
 +ok("tailTranscriptLines fromEnd emits newly appended rows", resumedTailLines.length === 1 && resumedTailLines[0]?.includes("\"new\"") === true);
 +
++const resumeBoundaryRows: TranscriptRow[] = [
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "historical" }] } },
++  { type: "user", message: { role: "user", content: "current prompt normalized by TUI" } },
++  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "current answer" }] } },
++];
++const boundedResumeRows = transcriptRowsAfterBaseline(resumeBoundaryRows, 1);
++ok(
++  "resume catch-up slices from the pre-launch transcript baseline",
++  Array.isArray(boundedResumeRows) &&
++    boundedResumeRows.length === 2 &&
++    boundedResumeRows[0]?.type === "user" &&
++    boundedResumeRows[1]?.type === "assistant"
++);
++ok(
++  "resume catch-up fails closed when the transcript shrank below its baseline",
++  transcriptRowsAfterBaseline(resumeBoundaryRows, 4) === null
++);
++
+ // isTurnDurationRow recognizes only the terminal turn_duration system row.
+ ok(
+   "isTurnDurationRow matches turn_duration",
 diff --git a/src/transcript.ts b/src/transcript.ts
-index f1e9480..747d7f4 100644
+index f1e9480..d210c8e 100644
 --- a/src/transcript.ts
 +++ b/src/transcript.ts
-@@ -89,0 +90,16 @@ export async function listAllTranscriptPaths(root: string = claudeProjectsRoot()
+@@ -87,6 +87,22 @@ export async function listAllTranscriptPaths(root: string = claudeProjectsRoot()
+   return paths;
+ }
+ 
 +/**
 + * Locate an existing transcript by Claude session id. Resume mode appends to
 + * the same JSONL file rather than creating a fresh one, so discovery based on
@@ -158,11 +410,74 @@ index f1e9480..747d7f4 100644
 +  return null;
 +}
 +
-@@ -181 +197,2 @@ export async function tailTranscriptLines(
+ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+ 
+ export async function waitForFreshTranscript(
+@@ -141,6 +157,55 @@ export async function readTranscriptLines(transcriptPath: string): Promise<strin
+   return (await readTranscriptEntries(transcriptPath)).map(entry => entry.line);
+ }
+ 
++function transcriptUserText(row: TranscriptRow): string | undefined {
++  if (row.type !== "user") return undefined;
++  const message = (row as { message?: unknown }).message;
++  if (!message || typeof message !== "object") return undefined;
++  const content = (message as { content?: unknown }).content;
++  if (typeof content === "string") return content;
++  if (!Array.isArray(content)) return undefined;
++  const text = content
++    .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
++    .filter(part => part.type === "text" && typeof part.text === "string")
++    .map(part => part.text as string)
++    .join("");
++  return text || undefined;
++}
++
++/**
++ * Slice a resumed transcript from the row count observed before the new TUI
++ * turn was launched. Unlike prompt-text matching this boundary survives Claude
++ * Code normalizing a large pasted prompt before persisting the user row.
++ */
++export function transcriptRowsAfterBaseline(
++  rows: TranscriptRow[],
++  baselineRows: number
++): TranscriptRow[] | null {
++  if (!Number.isInteger(baselineRows) || baselineRows < 0 || baselineRows > rows.length) {
++    return null;
++  }
++  return rows.slice(baselineRows);
++}
++
++/**
++ * A Claude --resume ... --fork-session transcript contains copied history
++ * before the newly submitted turn. Return only the final occurrence of that
++ * submitted user prompt and the rows after it, so compatibility output never
++ * replays inherited assistant/tool rows. null is fail-closed: without the
++ * submitted prompt there is no safe boundary between inherited and new rows.
++ */
++export function transcriptRowsFromLastUserPrompt(
++  rows: TranscriptRow[],
++  prompt: string
++): TranscriptRow[] | null {
++  let start = -1;
++  for (let i = 0; i < rows.length; i++) {
++    const text = transcriptUserText(rows[i]!);
++    if (text === prompt || text === "Human: " + prompt) start = i;
++  }
++  return start >= 0 ? rows.slice(start) : null;
++}
++
+ async function readTranscriptEntries(transcriptPath: string): Promise<TranscriptEntry[]> {
+   const file = Bun.file(transcriptPath);
+   if (!(await file.exists())) return [];
+@@ -178,9 +243,17 @@ export async function tailTranscript(
+ export async function tailTranscriptLines(
+   transcriptPath: string,
+   onLine: (line: string, index: number) => void,
 -  signal: AbortSignal
 +  signal: AbortSignal,
 +  fromEnd: boolean = false
-@@ -183,0 +201,7 @@ export async function tailTranscriptLines(
+ ): Promise<void> {
+   let offset = 0;
 +  if (fromEnd) {
 +    try {
 +      offset = statSync(transcriptPath).size;
@@ -170,3 +485,6 @@ index f1e9480..747d7f4 100644
 +      offset = 0;
 +    }
 +  }
+   let buffer = "";
+   let emitted = 0;
+   let decoder = new StringDecoder("utf8");

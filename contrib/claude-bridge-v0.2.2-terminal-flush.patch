@@ -1,6 +1,8 @@
+diff --git a/src/cli.ts b/src/cli.ts
+index 9030ad4..c12344f 100755
 --- a/src/cli.ts
 +++ b/src/cli.ts
-@@ -884,19 +884,22 @@
+@@ -906,19 +906,22 @@ async function emitClaudeStreamResult(stopEvent: RuntimeStopEvent, resultText: s
    }
    // Even an empty/odd turn gets init before the terminal result, like claude -p.
    ensureClaudeInit();
