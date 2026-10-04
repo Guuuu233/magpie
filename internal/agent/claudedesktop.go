@@ -28,12 +28,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
@@ -152,8 +155,14 @@ func claudeDesktop(home string) *Agent {
 			if id, _ := edit.GetJSON(p.meta, "appliedId"); id != desktopProfileID {
 				return "Claude Desktop uses another gateway configuration now (appliedId in configLibrary/_meta.json), not magpie's"
 			}
-			return wiringOff("Claude Desktop", p.prof, func(k string) (string, bool) { return edit.GetJSON(p.prof, k) },
-				"inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", gateway.TokenFor("claude-desktop"))
+			get := func(k string) (string, bool) { return edit.GetJSON(p.prof, k) }
+			base, _ := get("inferenceGatewayBaseUrl")
+			if !desktopGatewayReachesMagpie(base) {
+				return wiringOff("Claude Desktop", p.prof, get,
+					"inferenceGatewayBaseUrl", gateway.URL())
+			}
+			return wiringOff("Claude Desktop", p.prof, get,
+				"inferenceGatewayApiKey", gateway.TokenFor("claude-desktop"))
 		},
 		Fields: append([]Field{{
 			Key: "provider", Label: "provider",
@@ -182,6 +191,53 @@ func claudeDesktop(home string) *Agent {
 			},
 		}}, desktopTierFields(p)...),
 	}
+}
+
+// desktopGatewayReachesMagpie accepts magpie's own URL and a loopback proxy
+// that demonstrably forwards Desktop's authenticated /v1/models request to
+// magpie. This lets a local transport shim sit in front of magpie without the
+// Agent page incorrectly reporting that Claude Desktop was disconnected.
+func desktopGatewayReachesMagpie(base string) bool {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == strings.TrimRight(gateway.URL(), "/") {
+		return true
+	}
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || (u.Path != "" && u.Path != "/") {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "127.0.0.1", "localhost", "::1":
+	default:
+		return false
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+gateway.TokenFor("claude-desktop"))
+	client := &http.Client{Timeout: 750 * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		return false
+	}
+	return slices.ContainsFunc(catalog.Data, func(m struct {
+		ID string `json:"id"`
+	}) bool {
+		return strings.HasPrefix(m.ID, "magpie-")
+	})
 }
 
 // desktopTierFields pick the model each of Claude Code's tiers runs on in

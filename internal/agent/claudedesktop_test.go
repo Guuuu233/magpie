@@ -3,15 +3,62 @@ package agent
 import (
 	"encoding/json"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"testing"
 
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 )
+
+func TestClaudeDesktopGatewayProxyRecognizedAsMagpie(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+gateway.TokenFor("claude-desktop") {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"magpie-1234567890.anthropic.claude-opus-5-5"}]}`))
+	}))
+	defer proxy.Close()
+
+	if !desktopGatewayReachesMagpie(proxy.URL) {
+		t.Fatalf("local proxy to magpie was not recognized: %s", proxy.URL)
+	}
+}
+
+func TestClaudeDesktopCheckAcceptsLocalProxyToMagpie(t *testing.T) {
+	home, p := desktopSandbox(t)
+	os.MkdirAll(p.dir, 0o755)
+	a := claudeDesktop(home)
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"magpie-1234567890.anthropic.claude-opus-5-5"}]}`))
+	}))
+	defer proxy.Close()
+	if err := edit.SetJSON(p.prof, edit.KV{Path: "inferenceGatewayBaseUrl", Value: proxy.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Check(); got != "" {
+		t.Fatalf("proxy to magpie reported disconnected: %s", got)
+	}
+}
 
 // desktopSandbox is a home of its own with nothing of this machine's in
 // reach: every variable Desktop's folders (and magpie's stash) follow.
