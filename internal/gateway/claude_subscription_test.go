@@ -1087,6 +1087,64 @@ echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-i
 	}
 }
 
+func TestClaudeInteractiveHistoricalBootstrapKeepsFreshTextBesideDanglingToolResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+echo '{"type":"assistant","session_id":"sess-recover","uuid":"row-recover","message":{"id":"m-recover","model":"claude-opus-5-5","content":[{"type":"text","text":"RECOVERED"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-recover","stop_reason":"end_turn","result":"RECOVERED"}'
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"fetch","input_schema":{"type":"object"}}],"messages":[` +
+		`{"role":"user","content":"old user context"},` +
+		`{"role":"assistant","content":[{"type":"text","text":"old assistant context"},{"type":"tool_use","id":"toolu_old","name":"fetch","input":{"url":"https://old.invalid"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_old","content":"STALE_DANGLING_TOOL_RESULT"},{"type":"text","text":"继续"}]}]}`
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	req.Header.Set(SessionHeader, "desktop-historical-dangling-tool")
+	rec := httptest.NewRecorder()
+	var u Usage
+	if code, why := New().serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u); code != 200 {
+		t.Fatalf("historical bootstrap with fresh text = %d %s: %s", code, why, rec.Body.String())
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(data)
+	if !strings.Contains(log, "继续") {
+		t.Fatalf("fresh user text was lost:\n%s", log)
+	}
+	for _, stale := range []string{"STALE_DANGLING_TOOL_RESULT", "toolu_old", "https://old.invalid"} {
+		if strings.Contains(log, stale) {
+			t.Fatalf("dangling historical tool material leaked into bootstrap %q:\n%s", stale, log)
+		}
+	}
+}
+
+func TestClaudeInteractiveHistoricalBootstrapStillRefusesBareToolContinuation(t *testing.T) {
+	req := &Request{Messages: []Message{
+		{Role: "assistant", Parts: []Part{{Kind: ToolCall, ID: "toolu_pending", Name: "fetch"}}},
+		{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "toolu_pending", Text: "tool output"}}},
+	}}
+	if _, _, err := renderClaudeHistoricalBootstrapWithImages(req); err == nil ||
+		!strings.Contains(err.Error(), "refuses a live tool continuation") {
+		t.Fatalf("bare live tool continuation should still fail closed, got %v", err)
+	}
+}
+
 func TestClaudeInteractiveDirtyPersistedSessionIsNotRestored(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stands in for interactive bridge")

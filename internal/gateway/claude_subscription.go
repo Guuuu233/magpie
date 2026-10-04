@@ -1676,23 +1676,29 @@ const claudeHistoricalBootstrapMaxRunes = 600_000
 // The latest real user message remains live and may use the current MCP tools.
 func renderClaudeHistoricalBootstrapWithImages(req *Request) (string, map[string]Part, error) {
 	current := -1
+	var currentParts []Part
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		m := req.Messages[i]
 		if m.Role != "user" {
 			continue
 		}
-		live := false
+		hasToolContinuation := false
+		var liveParts []Part
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case ToolResult, ToolCall:
-				return "", nil, errors.New("Claude historical bootstrap refuses a live tool continuation without persisted inner state")
+				hasToolContinuation = true
 			case Text, File, Image:
-				live = true
+				liveParts = append(liveParts, p)
 			}
 		}
-		if live {
+		if len(liveParts) > 0 {
 			current = i
+			currentParts = liveParts
 			break
+		}
+		if hasToolContinuation {
+			return "", nil, errors.New("Claude historical bootstrap refuses a live tool continuation without persisted inner state")
 		}
 	}
 	if current < 0 {
@@ -1741,7 +1747,7 @@ func renderClaudeHistoricalBootstrapWithImages(req *Request) (string, map[string
 	}
 	text.WriteString(string(historyRunes))
 	text.WriteString("</historical_conversation_import>\n\n<current_user_request>\n")
-	blocks = renderParts(blocks, &text, req.Messages[current].Parts)
+	blocks = renderParts(blocks, &text, currentParts)
 	text.WriteString("\n</current_user_request>\nRespond to the current user request. Use current tools only when the current request requires them.\n")
 	return flattenClaudeBridgeBlocksWithImages(closeBlocks(blocks, &text))
 }
