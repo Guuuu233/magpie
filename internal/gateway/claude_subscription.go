@@ -52,8 +52,13 @@ type subscriptionBridge struct {
 	runs    map[string]*subscriptionRun // callback token → run
 	calls   map[string]*subscriptionRun // tool_use id → run
 	idle    map[string]*subscriptionRun // conversation so far (turnKey) → run
-	baseURL string
-	sweep   sync.Once
+	// outerThreads remembers which logical Claude conversation owns an outer
+	// client session while its first turn is still in flight. Claude Desktop
+	// reuses that outer session id for helper calls (WebSearch/WebFetch,
+	// subagents), so those must not claim or overwrite the main persisted slot.
+	outerThreads map[string]string // persisted outer-session key → firstWords(req)
+	baseURL      string
+	sweep        sync.Once
 }
 
 // A run left for its conversation's next turn waits idleLongest at most,
@@ -116,6 +121,7 @@ type subscriptionRun struct {
 	ephemeral     bool
 	sessionID     string
 	outerSession  string
+	threadKey     string
 	binary        string
 	mcpConfig     string
 	toolsPath     string
@@ -262,7 +268,45 @@ func evalSymlinks(path string) string {
 }
 
 func newSubscriptionBridge() *subscriptionBridge {
-	return &subscriptionBridge{runs: map[string]*subscriptionRun{}, calls: map[string]*subscriptionRun{}, idle: map[string]*subscriptionRun{}}
+	return &subscriptionBridge{
+		runs:         map[string]*subscriptionRun{},
+		calls:        map[string]*subscriptionRun{},
+		idle:         map[string]*subscriptionRun{},
+		outerThreads: map[string]string{},
+	}
+}
+
+func (b *subscriptionBridge) outerThread(owner, outerSession string) string {
+	if outerSession == "" {
+		return ""
+	}
+	key := interactiveSessionStateKey(owner, outerSession)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.outerThreads[key]
+}
+
+func (b *subscriptionBridge) seedOuterThread(owner, outerSession, thread string) string {
+	if outerSession == "" || thread == "" {
+		return ""
+	}
+	key := interactiveSessionStateKey(owner, outerSession)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.outerThreads[key] == "" {
+		b.outerThreads[key] = thread
+	}
+	return b.outerThreads[key]
+}
+
+func (b *subscriptionBridge) setOuterThread(owner, outerSession, thread string) {
+	if outerSession == "" || thread == "" {
+		return
+	}
+	key := interactiveSessionStateKey(owner, outerSession)
+	b.mu.Lock()
+	b.outerThreads[key] = thread
+	b.mu.Unlock()
 }
 
 func randomToken() string {
@@ -366,6 +410,7 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 	var bridgeImages map[string]Part
 	var resumeID string
 	var tools []bridgeTool
+	requestThreadKey := firstWords(req)
 	if interactive {
 		// A clean persisted mapping lets a gateway process restart reconnect the
 		// outer client conversation to the same real Claude session. Only the
@@ -374,6 +419,20 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 		// destroy the prompt-cache prefix the inner session already owns.
 		saved, since, restore := b.restoreInteractiveSession(owner, outerSession, req)
 		contextChanged := saved.SessionID != "" && saved.ContextKey != "" && saved.ContextKey != turnKey(owner, req, nil)
+		// Only an in-flight canonical thread is authoritative enough to
+		// classify a same-session request as an auxiliary side thread. A
+		// persisted ThreadKey by itself is deliberately not enough: after a
+		// restart, arbitrary rewritten history must still fail closed on a
+		// checkpoint miss rather than being waved through as "auxiliary".
+		activeThread := b.outerThread(owner, outerSession)
+		if activeThread == "" && restore == interactiveRestoreStateMissing && !suggestionFork {
+			activeThread = b.seedOuterThread(owner, outerSession, requestThreadKey)
+		}
+		threadMismatch := activeThread != "" && requestThreadKey != "" && activeThread != requestThreadKey
+		auxiliaryThreadMiss := threadMismatch &&
+			restore != interactiveRestoreExact &&
+			restore != interactiveRestoreReplyAnchor &&
+			restore != interactiveRestoreCompanion
 		auxiliaryModelMiss := restore == interactiveRestoreCheckpointNotFound &&
 			saved.SessionID != "" &&
 			((saved.Model != "" && saved.Model != model) ||
@@ -383,8 +442,8 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 			if len(key) > 12 {
 				key = key[:12]
 			}
-			if auxiliaryModelMiss && !suggestionFork {
-				log.Printf("Claude interactive auxiliary request isolated: reason=%s session=%s model=%s main_model=%s", restore, key, model, saved.Model)
+			if (auxiliaryThreadMiss || auxiliaryModelMiss) && !suggestionFork {
+				log.Printf("Claude interactive auxiliary request isolated: reason=%s session=%s model=%s main_model=%s thread_mismatch=%t", restore, key, model, saved.Model, auxiliaryThreadMiss)
 			}
 			switch restore {
 			case interactiveRestoreStateMissing:
@@ -398,22 +457,32 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 					log.Printf("Claude interactive persisted resume recovered: reason=context_changed session=%s", key)
 				}
 			default:
-				if !auxiliaryModelMiss {
+				if !auxiliaryThreadMiss && !auxiliaryModelMiss {
 					log.Printf("Claude interactive persisted resume refused: reason=%s session=%s", restore, key)
 				}
 			}
 		}
-		if auxiliaryModelMiss && !suggestionFork {
+		if (auxiliaryThreadMiss || auxiliaryModelMiss) && !suggestionFork {
 			// Claude Desktop's Code tab can launch an independent helper model
-			// (notably Haiku for WebFetch/small tasks) while reusing the outer
-			// session id of the main Opus/Sonnet conversation. Its message
-			// history is a separate thread, so trying to resume the main inner
-			// Claude session necessarily misses the saved reply checkpoint.
+			// (WebSearch/WebFetch/subagents, often Haiku) while reusing the
+			// outer session id of the main conversation. Its first user words
+			// identify a separate logical thread, so it must never claim or
+			// advance the main inner Claude checkpoint.
 			//
 			// Run that helper as an isolated one-shot Claude session instead:
 			// it must neither dirty nor advance the main persisted checkpoint.
 			cleanup()
 			return b.startWithMode(ctx, req, model, configDir, owner, "", true)
+		}
+		if !suggestionFork && outerSession != "" && requestThreadKey != "" &&
+			(restore == interactiveRestoreStateMissing ||
+				restore == interactiveRestoreExact ||
+				restore == interactiveRestoreReplyAnchor ||
+				restore == interactiveRestoreCompanion) {
+			// Once this request is known to be canonical, make its current
+			// first-words fingerprint the owner for helpers launched later in
+			// the same turn. A bare checkpoint miss never gets this privilege.
+			b.setOuterThread(owner, outerSession, requestThreadKey)
 		}
 		switch restore {
 		case interactiveRestoreExact, interactiveRestoreReplyAnchor, interactiveRestoreCompanion:
@@ -524,6 +593,7 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 		schema:       len(req.Schema) > 0,
 		sessionID:    resumeID,
 		outerSession: persistOuterSession,
+		threadKey:    requestThreadKey,
 		binary:       binary,
 		mcpConfig:    string(mcpConfig),
 		toolsPath:    toolsPath,
@@ -842,7 +912,7 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 		sessionID := r.sessionID
 		r.mu.Unlock()
 		b.saveInteractiveSession(r.owner, r.outerSession, interactiveSessionEntry{
-			SessionID: sessionID, Model: r.model, ConvKey: convKey, ReplyKey: assistantReplyKey(reply), ContextKey: turnKey(r.owner, req, nil),
+			SessionID: sessionID, Model: r.model, ThreadKey: r.threadKey, ConvKey: convKey, ReplyKey: assistantReplyKey(reply), ContextKey: turnKey(r.owner, req, nil),
 		})
 	}
 	r.timer.Reset(idleLongest)

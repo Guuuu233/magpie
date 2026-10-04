@@ -715,6 +715,96 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s",
 	}
 }
 
+func TestClaudeDesktopSameModelSideThreadDoesNotClaimMainSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case "$prompt" in
+  *"main thread slow"*) sleep 2; sid=sess-main; text=MAIN ;;
+  *"Perform a web search"*) sid=sess-side; text=SIDE ;;
+  *) sid=sess-other; text=OTHER ;;
+esac
+printf '{"type":"assistant","session_id":"%s","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$sid" "$text" "$text" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","stop_reason":"end_turn","result":"%s"}\n' "$sid" "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	outer := "desktop-session-side-thread"
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+
+	ask := func(text string) (int, string) {
+		body := `{"model":"claude-opus-5-5","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":` + strconv.Quote(text) + `}]}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, outer)
+		rec := httptest.NewRecorder()
+		var u Usage
+		code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-opus-5-5", []byte(body), &u)
+		if code != 200 {
+			return code, why + "\n" + rec.Body.String()
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			return 500, rec.Body.String()
+		}
+		return code, res.Content[0].Text
+	}
+
+	mainDone := make(chan struct {
+		code int
+		text string
+	}, 1)
+	go func() {
+		code, text := ask("main thread slow")
+		mainDone <- struct {
+			code int
+			text string
+		}{code, text}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if b, _ := os.ReadFile(logPath); strings.Contains(string(b), "main thread slow") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("main bridge did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	code, side := ask("Perform a web search for the query: example")
+	if code != 200 || side != "SIDE" {
+		t.Fatalf("side thread = %d %q", code, side)
+	}
+	owner := "claude\x00u\x00" + ownHome
+	if got, ok := s.subscription.interactiveSession(owner, outer); ok {
+		t.Fatalf("same-model side thread claimed the main persisted slot before main completed: %#v", got)
+	}
+
+	main := <-mainDone
+	if main.code != 200 || main.text != "MAIN" {
+		t.Fatalf("main = %d %q", main.code, main.text)
+	}
+	got, ok := s.subscription.interactiveSession(owner, outer)
+	if !ok || got.SessionID != "sess-main" {
+		t.Fatalf("main did not own persisted slot after completion: %#v, %v", got, ok)
+	}
+}
+
 func TestClaudeDesktopTurnCompanionDetection(t *testing.T) {
 	for _, text := range []string{
 		"[Your previous response had no visible output. Please continue and produce a user-visible response.]",

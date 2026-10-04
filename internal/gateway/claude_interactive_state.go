@@ -39,6 +39,7 @@ const (
 type interactiveSessionEntry struct {
 	SessionID  string    `json:"session_id"`
 	Model      string    `json:"model,omitempty"`
+	ThreadKey  string    `json:"thread_key,omitempty"`
 	ConvKey    string    `json:"conv_key"`
 	ReplyKey   string    `json:"reply_key,omitempty"`
 	ContextKey string    `json:"context_key"`
