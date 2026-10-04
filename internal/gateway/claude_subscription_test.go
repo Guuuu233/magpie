@@ -617,6 +617,104 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s",
 	}
 }
 
+func TestClaudeDesktopAuxiliaryModelCheckpointMissIsIsolated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stands in for interactive bridge")
+	}
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	dir := t.TempDir()
+	bridge := filepath.Join(dir, "claude-bridge")
+	logPath := filepath.Join(dir, "bridge.log")
+	script := `#!/bin/sh
+prompt=$(cat)
+printf 'args:%s\nstdin:%s\n' "$*" "$prompt" >> "$FAKE_BRIDGE_LOG"
+case " $* " in
+  *" --model claude-haiku-4-5 "*) sid=sess-side; text=SIDE ;;
+  *" --resume sess-main "*) sid=sess-main; text=MAIN2 ;;
+  *) sid=sess-main; text=MAIN1 ;;
+esac
+printf '{"type":"assistant","session_id":"%s","uuid":"row-%s","message":{"id":"m-%s","model":"claude-opus-5-5","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}\n' "$sid" "$text" "$text" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","stop_reason":"end_turn","result":"%s"}\n' "$sid" "$text"
+`
+	if err := os.WriteFile(bridge, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_CLAUDE_INTERACTIVE_BRIDGE", bridge)
+	t.Setenv("FAKE_BRIDGE_LOG", logPath)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	outer := "desktop-session-aux-model"
+	msg := func(role, text string) string { return `{"role":"` + role + `","content":` + strconv.Quote(text) + `}` }
+	ask := func(s *Server, model, msgs string) (int, string) {
+		t.Helper()
+		body := `{"model":"` + model + `","max_tokens":100,"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":` + msgs + `}`
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set(SessionHeader, outer)
+		rec := httptest.NewRecorder()
+		var u Usage
+		code, why := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, model, []byte(body), &u)
+		if code != 200 {
+			return code, why + "\n" + rec.Body.String()
+		}
+		var res struct {
+			Content []struct{ Text string } `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || len(res.Content) == 0 {
+			t.Fatalf("answer: %s (%v)", rec.Body, err)
+		}
+		return code, res.Content[0].Text
+	}
+
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	code, first := ask(s, "claude-opus-5-5", `[`+msg("user", "main thread")+`]`)
+	if code != 200 || first != "MAIN1" {
+		t.Fatalf("main first = %d %q", code, first)
+	}
+	owner := "claude\x00u\x00" + ownHome
+	before, ok := s.subscription.interactiveSession(owner, outer)
+	if !ok || before.SessionID != "sess-main" {
+		t.Fatalf("main state before side request: %#v, %v", before, ok)
+	}
+	// Existing persisted sessions from before this fix have no model field.
+	// They must still recognize Claude Code's Haiku helper as auxiliary.
+	legacy := before
+	legacy.Model = ""
+	s.subscription.saveInteractiveSession(owner, outer, legacy)
+	before = legacy
+
+	code, side := ask(s, "claude-haiku-4-5", `[`+msg("user", "summarize fetched web page")+`]`)
+	if code != 200 || side != "SIDE" {
+		t.Fatalf("auxiliary haiku = %d %q", code, side)
+	}
+	afterSide, ok := s.subscription.interactiveSession(owner, outer)
+	if !ok || afterSide.SessionID != before.SessionID || afterSide.ConvKey != before.ConvKey || afterSide.ReplyKey != before.ReplyKey {
+		t.Fatalf("auxiliary model advanced main checkpoint:\nbefore=%#v\nafter=%#v", before, afterSide)
+	}
+
+	code, second := ask(s, "claude-opus-5-5", `[`+msg("user", "main thread")+`,`+msg("assistant", first)+`,`+msg("user", "main next")+`]`)
+	if code != 200 || second != "MAIN2" {
+		t.Fatalf("main after auxiliary = %d %q", code, second)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logBytes)
+	var sideIsolated, mainResumed bool
+	for _, block := range strings.Split(log, "args:") {
+		switch {
+		case strings.Contains(block, "summarize fetched web page"):
+			sideIsolated = strings.Contains(block, "--model claude-haiku-4-5") && !strings.Contains(block, "--resume sess-main")
+		case strings.Contains(block, "main next"):
+			mainResumed = strings.Contains(block, "--resume sess-main")
+		}
+	}
+	if !sideIsolated || !mainResumed {
+		t.Fatalf("auxiliary model must be isolated while the main thread still resumes:\n%s", log)
+	}
+}
+
 func TestClaudeDesktopTurnCompanionDetection(t *testing.T) {
 	for _, text := range []string{
 		"[Your previous response had no visible output. Please continue and produce a user-visible response.]",

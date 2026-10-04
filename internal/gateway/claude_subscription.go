@@ -374,10 +374,17 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 		// destroy the prompt-cache prefix the inner session already owns.
 		saved, since, restore := b.restoreInteractiveSession(owner, outerSession, req)
 		contextChanged := saved.SessionID != "" && saved.ContextKey != "" && saved.ContextKey != turnKey(owner, req, nil)
+		auxiliaryModelMiss := restore == interactiveRestoreCheckpointNotFound &&
+			saved.SessionID != "" &&
+			((saved.Model != "" && saved.Model != model) ||
+				(saved.Model == "" && claudeTier(model) == "haiku"))
 		if outerSession != "" {
 			key := interactiveSessionStateKey(owner, outerSession)
 			if len(key) > 12 {
 				key = key[:12]
+			}
+			if auxiliaryModelMiss && !suggestionFork {
+				log.Printf("Claude interactive auxiliary request isolated: reason=%s session=%s model=%s main_model=%s", restore, key, model, saved.Model)
 			}
 			switch restore {
 			case interactiveRestoreStateMissing:
@@ -391,8 +398,22 @@ func (b *subscriptionBridge) startWithMode(ctx context.Context, req *Request, mo
 					log.Printf("Claude interactive persisted resume recovered: reason=context_changed session=%s", key)
 				}
 			default:
-				log.Printf("Claude interactive persisted resume refused: reason=%s session=%s", restore, key)
+				if !auxiliaryModelMiss {
+					log.Printf("Claude interactive persisted resume refused: reason=%s session=%s", restore, key)
+				}
 			}
+		}
+		if auxiliaryModelMiss && !suggestionFork {
+			// Claude Desktop's Code tab can launch an independent helper model
+			// (notably Haiku for WebFetch/small tasks) while reusing the outer
+			// session id of the main Opus/Sonnet conversation. Its message
+			// history is a separate thread, so trying to resume the main inner
+			// Claude session necessarily misses the saved reply checkpoint.
+			//
+			// Run that helper as an isolated one-shot Claude session instead:
+			// it must neither dirty nor advance the main persisted checkpoint.
+			cleanup()
+			return b.startWithMode(ctx, req, model, configDir, owner, "", true)
 		}
 		switch restore {
 		case interactiveRestoreExact, interactiveRestoreReplyAnchor, interactiveRestoreCompanion:
@@ -821,7 +842,7 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 		sessionID := r.sessionID
 		r.mu.Unlock()
 		b.saveInteractiveSession(r.owner, r.outerSession, interactiveSessionEntry{
-			SessionID: sessionID, ConvKey: convKey, ReplyKey: assistantReplyKey(reply), ContextKey: turnKey(r.owner, req, nil),
+			SessionID: sessionID, Model: r.model, ConvKey: convKey, ReplyKey: assistantReplyKey(reply), ContextKey: turnKey(r.owner, req, nil),
 		})
 	}
 	r.timer.Reset(idleLongest)
