@@ -2054,6 +2054,16 @@ func (b *subscriptionBridge) match(req *Request) (*subscriptionRun, []Part, stri
 			case p.Kind == ToolResult:
 				p.Images = slices.Clone(p.Images)
 				fresh = append(fresh, p)
+			case p.Kind == Text && len(fresh) > 0:
+				// Claude Code puts a message the user sends while a tool is
+				// running beside that tool_result (usually as a system reminder).
+				// A resumed subscription run only receives its MCP result, so keep
+				// the adjacent text with it instead of silently dropping the turn.
+				last := &fresh[len(fresh)-1]
+				if last.Text != "" && p.Text != "" {
+					last.Text += "\n\n"
+				}
+				last.Text += p.Text
 			case p.Kind == Image && len(fresh) > 0:
 				last := &fresh[len(fresh)-1]
 				last.Images = append(last.Images, p)
